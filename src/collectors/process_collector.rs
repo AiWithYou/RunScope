@@ -46,7 +46,6 @@ fn collect_process_infos(
 
     let mut processes = Vec::with_capacity(system.processes().len());
     let mut names_by_pid = HashMap::new();
-    let mut children_by_parent: HashMap<u32, Vec<u32>> = HashMap::new();
 
     for (pid, process) in system.processes() {
         let pid_u32 = pid.as_u32();
@@ -60,9 +59,6 @@ fn collect_process_infos(
             None
         };
 
-        if let Some(parent) = parent_pid {
-            children_by_parent.entry(parent).or_default().push(pid_u32);
-        }
         names_by_pid.insert(pid_u32, process.name().to_string());
 
         let gpu = vram_by_pid.get(&pid_u32).map(|usage| GpuProcessInfo {
@@ -93,6 +89,24 @@ fn collect_process_infos(
             codex_related: false,
             searchable_text_lower: String::new(),
         });
+    }
+
+    let start_times_by_pid = processes
+        .iter()
+        .map(|process| (process.pid, process.start_time))
+        .collect::<HashMap<_, _>>();
+    let mut children_by_parent: HashMap<u32, Vec<u32>> = HashMap::new();
+    for process in &processes {
+        let Some(parent_pid) = process.parent_pid else {
+            continue;
+        };
+        let parent_start_time = start_times_by_pid.get(&parent_pid).copied().flatten();
+        if verified_parent_relation(parent_start_time, process.start_time) {
+            children_by_parent
+                .entry(parent_pid)
+                .or_default()
+                .push(process.pid);
+        }
     }
 
     for process in &mut processes {
@@ -205,6 +219,16 @@ fn non_empty(value: String) -> Option<String> {
     }
 }
 
+fn verified_parent_relation(
+    parent_start_time: Option<std::time::SystemTime>,
+    child_start_time: Option<std::time::SystemTime>,
+) -> bool {
+    matches!(
+        (parent_start_time, child_start_time),
+        (Some(parent), Some(child)) if parent <= child
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,5 +252,30 @@ mod tests {
         assert!(current
             .searchable_text_lower
             .contains(&current.pid.to_string()));
+    }
+
+    #[test]
+    fn rejects_parent_relation_when_parent_is_newer_than_child() {
+        let parent = UNIX_EPOCH + Duration::from_secs(200);
+        let child = UNIX_EPOCH + Duration::from_secs(100);
+
+        assert!(!verified_parent_relation(Some(parent), Some(child)));
+    }
+
+    #[test]
+    fn rejects_parent_relation_without_both_start_times() {
+        let time = UNIX_EPOCH + Duration::from_secs(100);
+
+        assert!(!verified_parent_relation(None, Some(time)));
+        assert!(!verified_parent_relation(Some(time), None));
+    }
+
+    #[test]
+    fn accepts_parent_relation_when_parent_is_not_newer() {
+        let parent = UNIX_EPOCH + Duration::from_secs(100);
+        let child = UNIX_EPOCH + Duration::from_secs(101);
+
+        assert!(verified_parent_relation(Some(parent), Some(child)));
+        assert!(verified_parent_relation(Some(parent), Some(parent)));
     }
 }

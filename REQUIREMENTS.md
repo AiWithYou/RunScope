@@ -46,7 +46,7 @@ RunScope is a lightweight Windows RAM/VRAM process inspector. It helps find and 
   - Close
   - Kill
   - Kill Tree
-- Kill Tree must show a confirmation dialog with the target PID list.
+- Close, Kill, and Kill Tree must show a confirmation dialog with the target PID list.
 - Termination confirmation should show local web/listener URLs when available.
 - Protected process names must not be terminated.
 

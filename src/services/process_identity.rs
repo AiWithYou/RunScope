@@ -79,16 +79,21 @@ fn identity_matches(
     current_exe_path: Option<&str>,
     current_start_time: Option<SystemTime>,
 ) -> bool {
-    expected_name.eq_ignore_ascii_case(current_name)
-        && option_str_eq_ignore_ascii_case(expected_exe_path, current_exe_path)
-        && expected_start_time == current_start_time
-}
+    if !expected_name.eq_ignore_ascii_case(current_name) {
+        return false;
+    }
 
-fn option_str_eq_ignore_ascii_case(left: Option<&str>, right: Option<&str>) -> bool {
-    match (left, right) {
-        (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
-        (None, None) => true,
+    let start_time_matches = match (expected_start_time, current_start_time) {
+        (Some(expected), Some(current)) => expected == current,
         _ => false,
+    };
+    if !start_time_matches {
+        return false;
+    }
+
+    match (expected_exe_path, current_exe_path) {
+        (Some(expected), Some(current)) => expected.eq_ignore_ascii_case(current),
+        _ => true,
     }
 }
 
@@ -140,5 +145,23 @@ mod tests {
         let left = process(10, "python.exe", Some(r"C:\Python\python.exe"), 100);
         let right = process(10, "python.exe", Some(r"C:\Python\python.exe"), 101);
         assert!(!same_process(&left, &right));
+    }
+
+    #[test]
+    fn rejects_identity_when_start_time_is_unavailable() {
+        let mut left = process(10, "python.exe", Some(r"C:\Python\python.exe"), 100);
+        let mut right = left.clone();
+        left.start_time = None;
+        right.start_time = None;
+
+        assert!(!same_process(&left, &right));
+    }
+
+    #[test]
+    fn start_time_is_sufficient_when_one_executable_path_is_unavailable() {
+        let left = process(10, "python.exe", Some(r"C:\Python\python.exe"), 100);
+        let right = process(10, "python.exe", None, 100);
+
+        assert!(same_process(&left, &right));
     }
 }

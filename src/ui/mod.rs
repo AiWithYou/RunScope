@@ -271,17 +271,45 @@ fn draw_pending_dialog(ctx: &egui::Context, app: &mut WatcherApp) {
         return;
     };
 
-    let (title, confirm_label, targets) = match &action {
-        PendingAction::Kill { targets } => ("Kill process", "Kill", targets),
-        PendingAction::KillTree { targets } => ("Kill process tree", "Kill Tree", targets),
+    let (title, confirm_label, description, targets) = match &action {
+        PendingAction::Close { targets } => (
+            "Close process",
+            "Close",
+            "The selected process will be asked to close.",
+            targets,
+        ),
+        PendingAction::Kill { targets } => (
+            "Kill process",
+            "Kill",
+            "The selected process will be terminated.",
+            targets,
+        ),
+        PendingAction::KillTree { targets } => (
+            "Kill process tree",
+            "Kill Tree",
+            "These processes will be terminated.",
+            targets,
+        ),
     };
 
+    let screen_rect = ctx.screen_rect();
+    egui::Area::new(egui::Id::new("pending_action_backdrop"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(screen_rect.min)
+        .show(ctx, |ui| {
+            let (rect, _) =
+                ui.allocate_exact_size(screen_rect.size(), egui::Sense::click_and_drag());
+            ui.painter()
+                .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(96));
+        });
+
     egui::Window::new(title)
+        .order(egui::Order::Foreground)
         .collapsible(false)
         .resizable(true)
         .default_width(620.0)
         .show(ctx, |ui| {
-            ui.label("These processes will be terminated.");
+            ui.label(description);
             ui.add_space(6.0);
             egui::ScrollArea::vertical()
                 .max_height(260.0)

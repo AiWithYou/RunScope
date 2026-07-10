@@ -32,7 +32,9 @@ enum TableAction {
 pub fn draw(ui: &mut egui::Ui, app: &mut WatcherApp, max_height: f32) {
     let rows = app.visible_process_indices();
     let advanced = app.settings.table_view == TableView::Advanced;
-    let mut selected_pid = app.selected_pid;
+    let mut selected_pid = app
+        .selected_pid
+        .filter(|pid| rows.iter().any(|index| app.processes[*index].pid == *pid));
     let mut table_action = None;
     let table_height = max_height.max(0.0);
 
@@ -40,17 +42,19 @@ pub fn draw(ui: &mut egui::Ui, app: &mut WatcherApp, max_height: f32) {
         .id_source("process_table_scroll")
         .auto_shrink([false, false])
         .max_height(table_height)
-        .show(ui, |ui| {
-            draw_header(ui, advanced);
-            ui.separator();
+        .show_rows(ui, ROW_HEIGHT, rows.len() + 1, |ui, visible_rows| {
+            ui.set_min_width(table_width(advanced));
+            for visible_row in visible_rows {
+                if visible_row == 0 {
+                    draw_header(ui, advanced);
+                    if rows.is_empty() {
+                        ui.label("No processes match the current filters.");
+                    }
+                    continue;
+                }
 
-            if rows.is_empty() {
-                ui.label("No processes match the current filters.");
-                return;
-            }
-
-            for (row, process_index) in rows.iter().enumerate() {
-                let process = &app.processes[*process_index];
+                let row = visible_row - 1;
+                let process = &app.processes[rows[row]];
                 let selected = selected_pid == Some(process.pid);
                 draw_process_row(
                     ui,
@@ -69,7 +73,7 @@ pub fn draw(ui: &mut egui::Ui, app: &mut WatcherApp, max_height: f32) {
         match action {
             TableAction::Close(pid) => {
                 app.selected_pid = Some(pid);
-                app.close_selected();
+                app.request_close_selected();
             }
             TableAction::Kill(pid) => {
                 app.selected_pid = Some(pid);

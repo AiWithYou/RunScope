@@ -119,7 +119,7 @@ fn draw_action_card(
                 .add_enabled(!process.protected, egui::Button::new("Close"))
                 .clicked()
             {
-                app.close_selected();
+                app.request_close_selected();
             }
             if ui
                 .add_enabled(!process.protected, egui::Button::new("Kill"))

@@ -48,6 +48,7 @@ pub fn kill_tree(targets_root_first: &[ProcessInfo]) -> anyhow::Result<Vec<u32>>
 
 pub fn close_process(process: &ProcessInfo) -> anyhow::Result<usize> {
     ensure_not_protected(process)?;
+    process_identity::ensure_current_process_matches(process)?;
     close_pid(process.pid)
 }
 

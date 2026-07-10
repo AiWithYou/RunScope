@@ -38,6 +38,7 @@ pub struct WatcherApp {
 
 #[derive(Debug, Clone)]
 pub enum PendingAction {
+    Close { targets: Vec<ProcessInfo> },
     Kill { targets: Vec<ProcessInfo> },
     KillTree { targets: Vec<ProcessInfo> },
 }
@@ -156,8 +157,13 @@ impl WatcherApp {
     }
 
     pub fn selected_process(&self) -> Option<&ProcessInfo> {
-        self.selected_pid
-            .and_then(|pid| self.processes.iter().find(|process| process.pid == pid))
+        let query = self.search.trim().to_lowercase();
+        self.selected_pid.and_then(|pid| {
+            self.processes
+                .iter()
+                .find(|process| process.pid == pid)
+                .filter(|process| self.process_matches_filters(process, &query))
+        })
     }
 
     pub fn selected_process_summary(&self) -> Option<String> {
@@ -315,22 +321,18 @@ impl WatcherApp {
         self.pending_action = Some(PendingAction::KillTree { targets });
     }
 
-    pub fn close_selected(&mut self) {
+    pub fn request_close_selected(&mut self) {
         let Some(process) = self.selected_process().cloned() else {
             self.status = "No process selected.".to_string();
             return;
         };
-        match crate::services::terminator::close_process(&process) {
-            Ok(count) => {
-                self.status = format!(
-                    "WM_CLOSE sent to {count} window(s) for PID {}.",
-                    process.pid
-                );
-            }
-            Err(error) => {
-                self.status = format!("Close failed for PID {}: {error}", process.pid);
-            }
+        if process.protected {
+            self.status = format!("PID {} is protected.", process.pid);
+            return;
         }
+        self.pending_action = Some(PendingAction::Close {
+            targets: vec![process],
+        });
     }
 
     pub fn confirm_pending_action(&mut self, ctx: &egui::Context) {
@@ -339,6 +341,45 @@ impl WatcherApp {
         };
 
         match action {
+            PendingAction::Close { targets } => {
+                let Some(process) = targets.first() else {
+                    self.status = "No process selected.".to_string();
+                    return;
+                };
+                let current_processes =
+                    match process_collector::collect_processes_for_action(&self.settings) {
+                        Ok(processes) => processes,
+                        Err(error) => {
+                            self.status = format!("Close pre-check failed: {error}");
+                            return;
+                        }
+                    };
+                let Some(current) = current_processes
+                    .iter()
+                    .find(|candidate| candidate.pid == process.pid)
+                else {
+                    self.status = format!(
+                        "PID {} no longer exists. Reload and try again.",
+                        process.pid
+                    );
+                    return;
+                };
+                if let Err(error) = process_identity::ensure_same_process(process, current) {
+                    self.status = error.to_string();
+                    return;
+                }
+                match crate::services::terminator::close_process(current) {
+                    Ok(count) => {
+                        self.status = format!(
+                            "WM_CLOSE sent to {count} window(s) for PID {}.",
+                            process.pid
+                        );
+                    }
+                    Err(error) => {
+                        self.status = format!("Close failed for PID {}: {error}", process.pid);
+                    }
+                }
+            }
             PendingAction::Kill { targets } => {
                 let Some(process) = targets.first() else {
                     self.status = "No process selected.".to_string();
@@ -592,6 +633,13 @@ impl WatcherApp {
     }
 
     fn handle_keyboard_shortcuts(&mut self, ctx: &egui::Context) {
+        if self.pending_action.is_some() {
+            if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                self.cancel_pending_action();
+            }
+            return;
+        }
+
         if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F5)) {
             self.start_load(ctx);
         }
@@ -744,5 +792,51 @@ pub fn sort_processes(processes: &mut [ProcessInfo], sort: SortPreset) {
                 },
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filtered_out_selection_cannot_be_resolved_or_terminated() {
+        let mut app = WatcherApp {
+            processes: vec![ProcessInfo {
+                pid: 42,
+                name: "python.exe".to_string(),
+                python_related: true,
+                ..Default::default()
+            }],
+            selected_pid: Some(42),
+            ..Default::default()
+        };
+        app.settings.gpu_active_only = true;
+
+        assert!(app.selected_process().is_none());
+        app.request_kill_selected();
+        assert!(app.pending_action.is_none());
+        assert_eq!(app.status, "No process selected.");
+    }
+
+    #[test]
+    fn close_requires_confirmation() {
+        let mut app = WatcherApp {
+            processes: vec![ProcessInfo {
+                pid: 42,
+                name: "notepad.exe".to_string(),
+                start_time: Some(SystemTime::now()),
+                ..Default::default()
+            }],
+            selected_pid: Some(42),
+            ..Default::default()
+        };
+
+        app.request_close_selected();
+
+        assert!(matches!(
+            app.pending_action,
+            Some(PendingAction::Close { ref targets }) if targets.len() == 1 && targets[0].pid == 42
+        ));
     }
 }
