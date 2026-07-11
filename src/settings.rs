@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Settings {
     pub refresh_mode: RefreshMode,
@@ -13,6 +13,7 @@ pub struct Settings {
     pub local_web_only: bool,
     pub heavy_ram_only: bool,
     pub heavy_vram_only: bool,
+    pub memory_changed_only: bool,
     pub heavy_ram_threshold_mb: u64,
     pub heavy_vram_threshold_mb: u64,
     pub table_view: TableView,
@@ -59,27 +60,15 @@ impl Default for Settings {
             local_web_only: false,
             heavy_ram_only: false,
             heavy_vram_only: false,
+            memory_changed_only: false,
             heavy_ram_threshold_mb: 1024,
             heavy_vram_threshold_mb: 1024,
             table_view: TableView::Compact,
             default_sort: "VramDesc".to_string(),
-            protected_process_names: vec![
-                "System",
-                "Registry",
-                "Idle",
-                "csrss.exe",
-                "wininit.exe",
-                "winlogon.exe",
-                "services.exe",
-                "lsass.exe",
-                "smss.exe",
-                "svchost.exe",
-                "dwm.exe",
-                "explorer.exe",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect(),
+            protected_process_names: vec!["dwm.exe", "explorer.exe"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
             python_keywords: vec![
                 "python.exe",
                 "pythonw.exe",
@@ -181,6 +170,7 @@ mod tests {
         assert!(!settings.local_web_only);
         assert!(!settings.heavy_ram_only);
         assert!(!settings.heavy_vram_only);
+        assert!(!settings.memory_changed_only);
         assert_eq!(settings.heavy_ram_threshold_mb, 1024);
         assert_eq!(settings.heavy_vram_threshold_mb, 1024);
     }

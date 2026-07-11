@@ -58,7 +58,8 @@ pub fn collect_vram_by_pid() -> anyhow::Result<HashMap<u32, VramUsage>> {
             })
             .or_insert_with(|| VramUsage {
                 bytes,
-                device_name: "NVIDIA".to_string(),
+                device_indices: Vec::new(),
+                device_names: vec!["NVIDIA".to_string()],
                 process_type: GpuProcessType::Compute,
             });
     }

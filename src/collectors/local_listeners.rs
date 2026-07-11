@@ -41,20 +41,7 @@ fn collect_ipv4(listeners: &mut HashMap<u32, Vec<ListeningEndpoint>>) -> anyhow:
     use windows::Win32::Networking::WinSock::AF_INET;
 
     let buffer = tcp_table(AF_INET.0 as u32, TCP_TABLE_OWNER_PID_LISTENER)?;
-    if buffer.len() < std::mem::size_of::<u32>() {
-        bail!("IPv4 TCP table buffer is too small");
-    }
-
-    let count = unsafe { *(buffer.as_ptr() as *const u32) as usize };
-    let rows_ptr = unsafe {
-        buffer
-            .as_ptr()
-            .add(std::mem::size_of::<u32>())
-            .cast::<MIB_TCPROW_OWNER_PID>()
-    };
-
-    for index in 0..count {
-        let row = unsafe { *rows_ptr.add(index) };
+    for row in tcp_rows::<MIB_TCPROW_OWNER_PID>(&buffer, "IPv4")? {
         let pid = row.dwOwningPid;
         let port = port_from_network_order(row.dwLocalPort);
         if pid == 0 || port == 0 {
@@ -77,20 +64,7 @@ fn collect_ipv6(listeners: &mut HashMap<u32, Vec<ListeningEndpoint>>) -> anyhow:
     use windows::Win32::Networking::WinSock::AF_INET6;
 
     let buffer = tcp_table(AF_INET6.0 as u32, TCP_TABLE_OWNER_PID_LISTENER)?;
-    if buffer.len() < std::mem::size_of::<u32>() {
-        bail!("IPv6 TCP table buffer is too small");
-    }
-
-    let count = unsafe { *(buffer.as_ptr() as *const u32) as usize };
-    let rows_ptr = unsafe {
-        buffer
-            .as_ptr()
-            .add(std::mem::size_of::<u32>())
-            .cast::<MIB_TCP6ROW_OWNER_PID>()
-    };
-
-    for index in 0..count {
-        let row = unsafe { *rows_ptr.add(index) };
+    for row in tcp_rows::<MIB_TCP6ROW_OWNER_PID>(&buffer, "IPv6")? {
         let pid = row.dwOwningPid;
         let port = port_from_network_order(row.dwLocalPort);
         if pid == 0 || port == 0 {
@@ -104,6 +78,38 @@ fn collect_ipv6(listeners: &mut HashMap<u32, Vec<ListeningEndpoint>>) -> anyhow:
     }
 
     Ok(())
+}
+
+#[cfg(windows)]
+fn tcp_rows<T: Copy>(buffer: &[u8], label: &str) -> anyhow::Result<Vec<T>> {
+    let header_size = std::mem::size_of::<u32>();
+    if buffer.len() < header_size {
+        bail!("{label} TCP table buffer is too small");
+    }
+
+    let count = u32::from_ne_bytes(
+        buffer[..header_size]
+            .try_into()
+            .expect("u32 header has a fixed size"),
+    ) as usize;
+    let rows_size = count
+        .checked_mul(std::mem::size_of::<T>())
+        .and_then(|size| size.checked_add(header_size))
+        .ok_or_else(|| anyhow::anyhow!("{label} TCP table row count overflowed"))?;
+    if rows_size > buffer.len() {
+        bail!(
+            "{label} TCP table buffer is truncated: expected {rows_size} bytes, got {}",
+            buffer.len()
+        );
+    }
+
+    let mut rows = Vec::with_capacity(count);
+    for index in 0..count {
+        let offset = header_size + index * std::mem::size_of::<T>();
+        let row = unsafe { std::ptr::read_unaligned(buffer.as_ptr().add(offset).cast::<T>()) };
+        rows.push(row);
+    }
+    Ok(rows)
 }
 
 #[cfg(windows)]
@@ -125,22 +131,28 @@ fn tcp_table(
         return Ok(Vec::new());
     }
 
-    let mut buffer = vec![0_u8; size as usize];
-    let status = unsafe {
-        GetExtendedTcpTable(
-            Some(buffer.as_mut_ptr().cast()),
-            &mut size,
-            false,
-            address_family,
-            table_class,
-            0,
-        )
-    };
-    if status != NO_ERROR.0 {
-        bail!("GetExtendedTcpTable failed with code {status}");
+    let mut buffer = Vec::new();
+    for _ in 0..3 {
+        buffer.resize(size as usize, 0);
+        let status = unsafe {
+            GetExtendedTcpTable(
+                Some(buffer.as_mut_ptr().cast()),
+                &mut size,
+                false,
+                address_family,
+                table_class,
+                0,
+            )
+        };
+        if status == NO_ERROR.0 {
+            buffer.truncate(size as usize);
+            return Ok(buffer);
+        }
+        if status != ERROR_INSUFFICIENT_BUFFER.0 {
+            bail!("GetExtendedTcpTable failed with code {status}");
+        }
     }
-    buffer.truncate(size as usize);
-    Ok(buffer)
+    bail!("GetExtendedTcpTable kept resizing during collection")
 }
 
 fn port_from_network_order(port: u32) -> u16 {
@@ -150,9 +162,36 @@ fn port_from_network_order(port: u32) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::port_from_network_order;
+    #[cfg(windows)]
+    use super::tcp_rows;
 
     #[test]
     fn decodes_network_order_port() {
         assert_eq!(port_from_network_order(0x901f), 8080);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parses_unaligned_rows_and_rejects_truncated_buffers() {
+        #[repr(C)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        struct Row {
+            first: u16,
+            second: u16,
+        }
+
+        let mut valid = 1_u32.to_ne_bytes().to_vec();
+        valid.extend_from_slice(&7_u16.to_ne_bytes());
+        valid.extend_from_slice(&9_u16.to_ne_bytes());
+        assert_eq!(
+            tcp_rows::<Row>(&valid, "test").unwrap(),
+            vec![Row {
+                first: 7,
+                second: 9
+            }]
+        );
+
+        valid.pop();
+        assert!(tcp_rows::<Row>(&valid, "test").is_err());
     }
 }

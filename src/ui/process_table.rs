@@ -1,5 +1,5 @@
 use crate::app::WatcherApp;
-use crate::model::{ProcessInfo, ProcessScope};
+use crate::model::{ProcessInfo, ProcessScope, SortPreset};
 use crate::services::formatter;
 use crate::settings::TableView;
 
@@ -8,8 +8,8 @@ const CELL_PAD_X: f32 = 10.0;
 const SCOPE_WIDTH: f32 = 104.0;
 const PID_WIDTH: f32 = 86.0;
 const NAME_WIDTH: f32 = 280.0;
-const RAM_WIDTH: f32 = 92.0;
-const VRAM_WIDTH: f32 = 92.0;
+const RAM_WIDTH: f32 = 134.0;
+const VRAM_WIDTH: f32 = 134.0;
 const LOCAL_WEB_WIDTH: f32 = 300.0;
 const AGE_WIDTH: f32 = 104.0;
 const PARENT_PID_WIDTH: f32 = 94.0;
@@ -36,39 +36,55 @@ pub fn draw(ui: &mut egui::Ui, app: &mut WatcherApp, max_height: f32) {
         .selected_pid
         .filter(|pid| rows.iter().any(|index| app.processes[*index].pid == *pid));
     let mut table_action = None;
+    let mut requested_sort = None;
     let table_height = max_height.max(0.0);
+    let scroll_request = app.take_table_scroll_request();
 
-    egui::ScrollArea::both()
+    let mut scroll_area = egui::ScrollArea::both()
         .id_source("process_table_scroll")
         .auto_shrink([false, false])
-        .max_height(table_height)
-        .show_rows(ui, ROW_HEIGHT, rows.len() + 1, |ui, visible_rows| {
-            ui.set_min_width(table_width(advanced));
-            for visible_row in visible_rows {
-                if visible_row == 0 {
-                    draw_header(ui, advanced);
-                    if rows.is_empty() {
-                        ui.label("No processes match the current filters.");
+        .max_height(table_height);
+    if let Some(row) = scroll_request {
+        scroll_area = scroll_area.vertical_scroll_offset((row + 1) as f32 * ROW_HEIGHT);
+    }
+    scroll_area.show_rows(ui, ROW_HEIGHT, rows.len() + 1, |ui, visible_rows| {
+        ui.set_min_width(table_width(advanced));
+        for visible_row in visible_rows {
+            if visible_row == 0 {
+                requested_sort = draw_header(ui, advanced, app.sort).or(requested_sort);
+                if rows.is_empty() {
+                    if app.loading {
+                        ui.label("Loading process snapshot...");
+                    } else if app.last_updated.is_none() {
+                        ui.label(
+                            "Click Load / Reload (or press F5) to collect the first snapshot.",
+                        );
+                    } else {
+                        ui.label("No processes match the current search and filters.");
                     }
-                    continue;
                 }
-
-                let row = visible_row - 1;
-                let process = &app.processes[rows[row]];
-                let selected = selected_pid == Some(process.pid);
-                draw_process_row(
-                    ui,
-                    process,
-                    row,
-                    selected,
-                    advanced,
-                    &mut selected_pid,
-                    &mut table_action,
-                );
+                continue;
             }
-        });
+
+            let row = visible_row - 1;
+            let process = &app.processes[rows[row]];
+            let selected = selected_pid == Some(process.pid);
+            draw_process_row(
+                ui,
+                process,
+                row,
+                selected,
+                advanced,
+                &mut selected_pid,
+                &mut table_action,
+            );
+        }
+    });
 
     app.selected_pid = selected_pid;
+    if let Some(sort) = requested_sort {
+        app.set_sort(sort);
+    }
     if let Some(action) = table_action {
         match action {
             TableAction::Close(pid) => {
@@ -87,9 +103,10 @@ pub fn draw(ui: &mut egui::Ui, app: &mut WatcherApp, max_height: f32) {
     }
 }
 
-fn draw_header(ui: &mut egui::Ui, advanced: bool) {
+fn draw_header(ui: &mut egui::Ui, advanced: bool, current_sort: SortPreset) -> Option<SortPreset> {
     let width = table_width(advanced).max(ui.available_width());
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, ROW_HEIGHT), egui::Sense::hover());
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(width, ROW_HEIGHT), egui::Sense::click());
     let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
     painter.rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
 
@@ -117,7 +134,7 @@ fn draw_header(ui: &mut egui::Ui, advanced: bool) {
     paint_text(
         ui,
         next_rect(rect, &mut x, RAM_WIDTH),
-        "RAM MB",
+        "RAM MB (delta)",
         CellAlign::Right,
         color,
         font.clone(),
@@ -125,7 +142,7 @@ fn draw_header(ui: &mut egui::Ui, advanced: bool) {
     paint_text(
         ui,
         next_rect(rect, &mut x, VRAM_WIDTH),
-        "VRAM MB",
+        "VRAM MB (delta)",
         CellAlign::Right,
         color,
         font.clone(),
@@ -168,6 +185,65 @@ fn draw_header(ui: &mut egui::Ui, advanced: bool) {
             CellAlign::Left,
         );
     }
+
+    let response =
+        response.on_hover_text("Click PID, Process Name, RAM, VRAM, or Age to toggle sorting.");
+    if response.clicked() {
+        response
+            .interact_pointer_pos()
+            .and_then(|position| sort_for_header_x(position.x - rect.left(), current_sort))
+    } else {
+        None
+    }
+}
+
+fn sort_for_header_x(x: f32, current: SortPreset) -> Option<SortPreset> {
+    let mut edge = SCOPE_WIDTH;
+    if x < edge {
+        return None;
+    }
+    edge += PID_WIDTH;
+    if x < edge {
+        return Some(if current == SortPreset::PidAsc {
+            SortPreset::PidDesc
+        } else {
+            SortPreset::PidAsc
+        });
+    }
+    edge += NAME_WIDTH;
+    if x < edge {
+        return Some(if current == SortPreset::NameAsc {
+            SortPreset::NameDesc
+        } else {
+            SortPreset::NameAsc
+        });
+    }
+    edge += RAM_WIDTH;
+    if x < edge {
+        return Some(if current == SortPreset::RamDesc {
+            SortPreset::RamAsc
+        } else {
+            SortPreset::RamDesc
+        });
+    }
+    edge += VRAM_WIDTH;
+    if x < edge {
+        return Some(if current == SortPreset::VramDesc {
+            SortPreset::VramAsc
+        } else {
+            SortPreset::VramDesc
+        });
+    }
+    edge += LOCAL_WEB_WIDTH;
+    if x < edge {
+        return None;
+    }
+    edge += AGE_WIDTH;
+    (x < edge).then_some(if current == SortPreset::AgeNewest {
+        SortPreset::AgeOldest
+    } else {
+        SortPreset::AgeNewest
+    })
 }
 
 fn paint_header_cell(ui: &mut egui::Ui, rect: egui::Rect, text: &str, align: CellAlign) {
@@ -194,7 +270,9 @@ fn draw_process_row(
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(width, ROW_HEIGHT), egui::Sense::click());
     let row_fill = if selected {
-        egui::Color32::from_rgb(204, 232, 248)
+        ui.visuals().selection.bg_fill
+    } else if response.hovered() {
+        ui.visuals().widgets.hovered.bg_fill
     } else if row.is_multiple_of(2) {
         ui.visuals().faint_bg_color
     } else {
@@ -205,7 +283,11 @@ fn draw_process_row(
 
     let body_font = egui::TextStyle::Body.resolve(ui.style());
     let mono_font = egui::TextStyle::Monospace.resolve(ui.style());
-    let text_color = ui.visuals().text_color();
+    let text_color = if selected {
+        ui.visuals().selection.stroke.color
+    } else {
+        ui.visuals().text_color()
+    };
     let link_color = ui.visuals().hyperlink_color;
     let mut x = rect.left();
 
@@ -234,7 +316,7 @@ fn draw_process_row(
     paint_text(
         ui,
         next_rect(rect, &mut x, RAM_WIDTH),
-        &formatter::bytes_to_mb_text(process.ram_bytes),
+        &formatter::bytes_with_delta_mb_text(process.ram_bytes, process.ram_delta_bytes),
         CellAlign::Right,
         text_color,
         body_font.clone(),
@@ -242,7 +324,10 @@ fn draw_process_row(
     paint_text(
         ui,
         next_rect(rect, &mut x, VRAM_WIDTH),
-        &formatter::optional_bytes_to_mb_text(process.vram_bytes()),
+        &formatter::optional_bytes_with_delta_mb_text(
+            process.vram_bytes(),
+            process.vram_delta_bytes,
+        ),
         CellAlign::Right,
         text_color,
         body_font.clone(),
@@ -315,11 +400,23 @@ fn draw_process_row(
         .is_some_and(|pos| local_web_rect.contains(pos));
     let response = if hovered_local_web && local_web_url.is_some() {
         response.on_hover_text(process.local_web_summary())
+    } else if process.ram_delta_bytes.is_some() || process.vram_delta_bytes.is_some() {
+        response.on_hover_text(format!(
+            "Snapshot state: {}\nRAM delta: {} MB\nVRAM delta: {} MB",
+            process.snapshot_state,
+            formatter::optional_delta_mb_text(process.ram_delta_bytes),
+            formatter::optional_delta_mb_text(process.vram_delta_bytes)
+        ))
     } else {
         response
     };
 
-    if response.clicked() {
+    if response.double_clicked() {
+        *selected_pid = Some(process.pid);
+        if let Some(url) = local_web_url {
+            ui.ctx().open_url(egui::OpenUrl::new_tab(&url));
+        }
+    } else if response.clicked() {
         *selected_pid = Some(process.pid);
         if hovered_local_web {
             if let Some(url) = local_web_url {
@@ -483,6 +580,14 @@ fn draw_process_context_menu(
         }
     } else {
         ui.add_enabled(false, egui::Button::new("Copy Command Line"));
+    }
+    if let Some(cwd) = &process.cwd {
+        if ui.button("Copy CWD").clicked() {
+            ui.ctx().copy_text(cwd.clone());
+            ui.close_menu();
+        }
+    } else {
+        ui.add_enabled(false, egui::Button::new("Copy CWD"));
     }
 
     ui.separator();

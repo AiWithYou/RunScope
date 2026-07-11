@@ -1,6 +1,9 @@
 $ErrorActionPreference = "Stop"
 
 cargo build --release
+if ($LASTEXITCODE -ne 0) {
+    throw "cargo build --release failed with exit code $LASTEXITCODE"
+}
 
 $distDir = "dist"
 $exePath = Join-Path $distDir "RunScope.exe"

@@ -1,32 +1,79 @@
 use crate::collectors::{gpu_nvidia_smi, gpu_nvml, gpu_windows_perf, local_listeners};
-use crate::model::{GpuProcessInfo, ProcessInfo, ProcessSnapshot};
+use crate::model::{GpuProcessInfo, ProcessInfo, ProcessSnapshot, SnapshotState};
 use crate::services::scope_detector;
 use crate::settings::Settings;
 use anyhow::bail;
 use std::collections::HashMap;
-use std::sync::mpsc;
+use std::sync::{mpsc, OnceLock};
 use std::thread;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use sysinfo::{ProcessRefreshKind, System, UpdateKind};
 
 pub fn collect_processes(settings: &Settings) -> anyhow::Result<ProcessSnapshot> {
-    let (vram_by_pid, vram_status) = collect_vram();
-    let (listeners_by_pid, listener_status) = collect_listeners();
+    let total_started = Instant::now();
+    let (
+        ((vram_by_pid, vram_status), vram_elapsed),
+        ((listeners_by_pid, listener_status), listener_elapsed),
+    ) = thread::scope(|scope| {
+        let vram_worker = scope.spawn(|| {
+            let started = Instant::now();
+            (collect_vram(), started.elapsed())
+        });
+        let listener_worker = scope.spawn(|| {
+            let started = Instant::now();
+            (collect_listeners(), started.elapsed())
+        });
+        let vram = vram_worker.join().unwrap_or_else(|_| {
+            (
+                (
+                    HashMap::new(),
+                    "VRAM unavailable: collector worker panicked".to_string(),
+                ),
+                Duration::ZERO,
+            )
+        });
+        let listeners = listener_worker.join().unwrap_or_else(|_| {
+            (
+                (
+                    HashMap::new(),
+                    "Local listeners unavailable: collector worker panicked".to_string(),
+                ),
+                Duration::ZERO,
+            )
+        });
+        (vram, listeners)
+    });
+    let process_started = Instant::now();
     let processes = collect_process_infos(settings, &vram_by_pid, &listeners_by_pid);
+    let process_elapsed = process_started.elapsed();
 
     Ok(ProcessSnapshot {
         processes,
         vram_status,
         listener_status,
+        timing_status: format!(
+            "Load: {} (VRAM {}, listeners {}, processes {})",
+            duration_text(total_started.elapsed()),
+            duration_text(vram_elapsed),
+            duration_text(listener_elapsed),
+            duration_text(process_elapsed)
+        ),
     })
 }
 
+fn duration_text(duration: Duration) -> String {
+    if duration.as_secs() > 0 {
+        format!("{:.2}s", duration.as_secs_f64())
+    } else {
+        format!("{}ms", duration.as_millis())
+    }
+}
+
 pub fn collect_processes_for_action(settings: &Settings) -> anyhow::Result<Vec<ProcessInfo>> {
-    let (listeners_by_pid, _) = collect_listeners();
     Ok(collect_process_infos(
         settings,
         &HashMap::new(),
-        &listeners_by_pid,
+        &HashMap::new(),
     ))
 }
 
@@ -62,8 +109,8 @@ fn collect_process_infos(
         names_by_pid.insert(pid_u32, process.name().to_string());
 
         let gpu = vram_by_pid.get(&pid_u32).map(|usage| GpuProcessInfo {
-            device_index: 0,
-            device_name: usage.device_name.clone(),
+            device_indices: usage.device_indices.clone(),
+            device_names: usage.device_names.clone(),
             vram_bytes: Some(usage.bytes),
             process_type: usage.process_type,
         });
@@ -79,6 +126,9 @@ fn collect_process_infos(
             start_time,
             ram_bytes: process.memory(),
             virtual_memory_bytes: process.virtual_memory(),
+            ram_delta_bytes: None,
+            vram_delta_bytes: None,
+            snapshot_state: SnapshotState::Unavailable,
             gpu,
             local_endpoints: listeners_by_pid.get(&pid_u32).cloned().unwrap_or_default(),
             children: Vec::new(),
@@ -195,10 +245,35 @@ fn collect_vram() -> (HashMap<u32, gpu_nvml::VramUsage>, String) {
 pub fn collect_nvml_with_timeout(
     timeout: Duration,
 ) -> anyhow::Result<HashMap<u32, gpu_nvml::VramUsage>> {
-    let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || {
-        let _ = sender.send(gpu_nvml::collect_vram_by_pid_nvml());
+    type NvmlResult = anyhow::Result<HashMap<u32, gpu_nvml::VramUsage>>;
+    type NvmlRequest = mpsc::Sender<NvmlResult>;
+    static NVML_WORKER: OnceLock<Result<mpsc::SyncSender<NvmlRequest>, String>> = OnceLock::new();
+
+    let worker = NVML_WORKER.get_or_init(|| {
+        let (request_sender, request_receiver) = mpsc::sync_channel::<NvmlRequest>(1);
+        thread::Builder::new()
+            .name("runscope-nvml".to_string())
+            .spawn(move || {
+                while let Ok(response_sender) = request_receiver.recv() {
+                    let _ = response_sender.send(gpu_nvml::collect_vram_by_pid_nvml());
+                }
+            })
+            .map(|_| request_sender)
+            .map_err(|error| error.to_string())
     });
+    let worker = worker
+        .as_ref()
+        .map_err(|error| anyhow::anyhow!("failed to start NVML worker: {error}"))?;
+    let (sender, receiver) = mpsc::channel();
+    match worker.try_send(sender) {
+        Ok(()) => {}
+        Err(mpsc::TrySendError::Full(_)) => {
+            bail!("NVML worker is still busy from an earlier request");
+        }
+        Err(mpsc::TrySendError::Disconnected(_)) => {
+            bail!("NVML worker disconnected");
+        }
+    }
 
     match receiver.recv_timeout(timeout) {
         Ok(result) => result,

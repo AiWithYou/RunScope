@@ -12,6 +12,9 @@ pub struct ProcessInfo {
     pub start_time: Option<SystemTime>,
     pub ram_bytes: u64,
     pub virtual_memory_bytes: u64,
+    pub ram_delta_bytes: Option<i64>,
+    pub vram_delta_bytes: Option<i64>,
+    pub snapshot_state: SnapshotState,
     pub gpu: Option<GpuProcessInfo>,
     pub local_endpoints: Vec<ListeningEndpoint>,
     pub children: Vec<u32>,
@@ -38,7 +41,7 @@ impl ProcessInfo {
 
     fn build_searchable_text_lower(&self) -> String {
         format!(
-            "{} {} {} {} {} {} {} {}",
+            "{} {} {} {} {} {} {} {} {}",
             self.scope,
             self.pid,
             self.name,
@@ -46,7 +49,8 @@ impl ProcessInfo {
             self.exe_path.as_deref().unwrap_or_default(),
             self.command_line.as_deref().unwrap_or_default(),
             self.protection_reason.as_deref().unwrap_or_default(),
-            self.local_web_summary()
+            self.local_web_summary(),
+            self.snapshot_state
         )
         .to_lowercase()
     }
@@ -101,6 +105,27 @@ impl ProcessInfo {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SnapshotState {
+    #[default]
+    Unavailable,
+    New,
+    Changed,
+    Unchanged,
+}
+
+impl std::fmt::Display for SnapshotState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text = match self {
+            Self::Unavailable => "No baseline",
+            Self::New => "New",
+            Self::Changed => "Changed",
+            Self::Unchanged => "Unchanged",
+        };
+        f.write_str(text)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ListeningEndpoint {
     pub bind_address: String,
@@ -141,8 +166,8 @@ impl ListeningEndpoint {
 
 #[derive(Debug, Clone, Default)]
 pub struct GpuProcessInfo {
-    pub device_index: u32,
-    pub device_name: String,
+    pub device_indices: Vec<u32>,
+    pub device_names: Vec<String>,
     pub vram_bytes: Option<u64>,
     pub process_type: GpuProcessType,
 }
@@ -183,24 +208,86 @@ pub enum GpuProcessType {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SortPreset {
+    RamAsc,
     RamDesc,
+    VramAsc,
     #[default]
     VramDesc,
+    NameAsc,
+    NameDesc,
+    PidAsc,
+    PidDesc,
+    AgeNewest,
+    AgeOldest,
+    RamGrowth,
+    VramGrowth,
 }
 
 impl SortPreset {
+    pub const ALL: [Self; 12] = [
+        Self::VramDesc,
+        Self::RamDesc,
+        Self::VramGrowth,
+        Self::RamGrowth,
+        Self::NameAsc,
+        Self::NameDesc,
+        Self::PidAsc,
+        Self::PidDesc,
+        Self::AgeNewest,
+        Self::AgeOldest,
+        Self::VramAsc,
+        Self::RamAsc,
+    ];
+
     pub fn from_settings(value: &str) -> Self {
         match value {
+            "RamAsc" => Self::RamAsc,
             "RamDesc" => Self::RamDesc,
+            "VramAsc" => Self::VramAsc,
             "VramDesc" => Self::VramDesc,
+            "NameAsc" => Self::NameAsc,
+            "NameDesc" => Self::NameDesc,
+            "PidAsc" => Self::PidAsc,
+            "PidDesc" => Self::PidDesc,
+            "AgeNewest" => Self::AgeNewest,
+            "AgeOldest" => Self::AgeOldest,
+            "RamGrowth" => Self::RamGrowth,
+            "VramGrowth" => Self::VramGrowth,
             _ => Self::VramDesc,
         }
     }
 
     pub fn as_settings_value(self) -> &'static str {
         match self {
+            Self::RamAsc => "RamAsc",
             Self::RamDesc => "RamDesc",
+            Self::VramAsc => "VramAsc",
             Self::VramDesc => "VramDesc",
+            Self::NameAsc => "NameAsc",
+            Self::NameDesc => "NameDesc",
+            Self::PidAsc => "PidAsc",
+            Self::PidDesc => "PidDesc",
+            Self::AgeNewest => "AgeNewest",
+            Self::AgeOldest => "AgeOldest",
+            Self::RamGrowth => "RamGrowth",
+            Self::VramGrowth => "VramGrowth",
+        }
+    }
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::RamAsc => "RAM low to high",
+            Self::RamDesc => "RAM high to low",
+            Self::VramAsc => "VRAM low to high",
+            Self::VramDesc => "VRAM high to low",
+            Self::NameAsc => "Name A to Z",
+            Self::NameDesc => "Name Z to A",
+            Self::PidAsc => "PID low to high",
+            Self::PidDesc => "PID high to low",
+            Self::AgeNewest => "Newest process",
+            Self::AgeOldest => "Oldest process",
+            Self::RamGrowth => "RAM growth",
+            Self::VramGrowth => "VRAM growth",
         }
     }
 }
@@ -210,6 +297,7 @@ pub struct ProcessSnapshot {
     pub processes: Vec<ProcessInfo>,
     pub vram_status: String,
     pub listener_status: String,
+    pub timing_status: String,
 }
 
 #[cfg(test)]

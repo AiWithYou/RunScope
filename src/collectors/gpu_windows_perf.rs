@@ -62,7 +62,8 @@ pub fn collect_vram_by_pid_windows_perf() -> anyhow::Result<HashMap<u32, VramUsa
             })
             .or_insert_with(|| VramUsage {
                 bytes,
-                device_name: "Windows GPU Process Memory".to_string(),
+                device_indices: Vec::new(),
+                device_names: vec!["Windows GPU Process Memory".to_string()],
                 process_type: GpuProcessType::Unknown,
             });
     }

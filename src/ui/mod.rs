@@ -135,8 +135,7 @@ fn draw_toolbar_row(ui: &mut egui::Ui, ctx: &egui::Context, app: &mut WatcherApp
 
         let mut auto_refresh = app.settings.auto_refresh_enabled();
         if ui.checkbox(&mut auto_refresh, "Auto refresh").changed() {
-            app.settings.set_auto_refresh_enabled(auto_refresh);
-            app.save_settings_quietly();
+            app.set_auto_refresh_enabled(auto_refresh);
         }
 
         ui.label("Refresh interval");
@@ -147,6 +146,8 @@ fn draw_toolbar_row(ui: &mut egui::Ui, ctx: &egui::Context, app: &mut WatcherApp
                 ui.selectable_value(&mut interval, 2000, "2s");
                 ui.selectable_value(&mut interval, 5000, "5s");
                 ui.selectable_value(&mut interval, 10000, "10s");
+                ui.selectable_value(&mut interval, 30000, "30s");
+                ui.selectable_value(&mut interval, 60000, "60s");
             });
         if interval != app.settings.auto_refresh_interval_ms {
             app.settings.auto_refresh_interval_ms = interval;
@@ -157,6 +158,50 @@ fn draw_toolbar_row(ui: &mut egui::Ui, ctx: &egui::Context, app: &mut WatcherApp
         if ui.button("Settings").clicked() {
             app.open_settings_window();
         }
+        ui.menu_button("Copy", |ui| {
+            if ui.button("Visible table as TSV").clicked() {
+                app.copy_visible_tsv(ctx);
+                ui.close_menu();
+            }
+            if ui.button("Visible PIDs").clicked() {
+                app.copy_visible_pids(ctx);
+                ui.close_menu();
+            }
+            if ui
+                .add_enabled(
+                    app.selected_process().is_some(),
+                    egui::Button::new("Selected as JSON"),
+                )
+                .clicked()
+            {
+                app.copy_selected_json(ctx);
+                ui.close_menu();
+            }
+            ui.separator();
+            if ui.button("Diagnostics").clicked() {
+                app.copy_diagnostics(ctx);
+                ui.close_menu();
+            }
+        });
+        ui.menu_button("Help", |ui| {
+            ui.strong("Keyboard");
+            ui.monospace("F5 / Ctrl+R  Reload");
+            ui.monospace("Ctrl+F       Focus search");
+            ui.monospace("Up/Down      Move selection");
+            ui.monospace("PageUp/Down  Move 10 rows");
+            ui.monospace("Home/End     First/last row");
+            ui.monospace("Enter        Open Local Web");
+            ui.monospace("Ctrl+C       Copy summary");
+            ui.monospace("Ctrl+Shift+C Copy visible TSV");
+            ui.monospace("Delete       Review Kill");
+            ui.monospace("Esc          Clear search/filter");
+            ui.separator();
+            ui.strong("Search examples");
+            ui.monospace("name:python -cmd:test");
+            ui.monospace("port:7860 ram:>1024");
+            ui.monospace("scope:gpu state:changed");
+            ui.monospace("path:\"program files\"");
+        });
     });
 }
 
@@ -166,10 +211,30 @@ fn draw_filter_row(ui: &mut egui::Ui, app: &mut WatcherApp) {
         let search_id = egui::Id::new("runscope_search_text");
         let search_response = ui.add_sized(
             [320.0, 22.0],
-            egui::TextEdit::singleline(&mut app.search).id_source(search_id),
+            egui::TextEdit::singleline(&mut app.search)
+                .id_source(search_id)
+                .hint_text("name:python  port:7860  ram:>1024  -test"),
         );
         if app.take_search_focus_request() {
             search_response.request_focus();
+        }
+        if search_response.has_focus()
+            && ui.input_mut(|input| {
+                input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+            })
+        {
+            app.search.clear();
+            search_response.surrender_focus();
+            app.status = "Search cleared.".to_string();
+        }
+        search_response.on_hover_text(
+            "AND terms with spaces. Fields: pid, name, scope, path, cmd, parent, port, web, state, ram, vram. Prefix - to exclude. Quotes keep spaces together.",
+        );
+        if ui
+            .add_enabled(!app.search.is_empty(), egui::Button::new("Clear"))
+            .clicked()
+        {
+            app.search.clear();
         }
 
         ui.separator();
@@ -180,10 +245,11 @@ fn draw_filter_row(ui: &mut egui::Ui, app: &mut WatcherApp) {
         quick_filter_button(ui, app, QuickFilter::CodexTerminal, "Codex/Claude");
         quick_filter_button(ui, app, QuickFilter::HeavyRam, "Heavy RAM");
         quick_filter_button(ui, app, QuickFilter::HeavyVram, "Heavy VRAM");
+        quick_filter_button(ui, app, QuickFilter::Changed, "New / Changed");
 
         ui.separator();
         let mut hide_system = !app.settings.show_system_processes;
-        if ui.checkbox(&mut hide_system, "Hide system").changed() {
+        if ui.checkbox(&mut hide_system, "Hide protected").changed() {
             app.settings.show_system_processes = !hide_system;
             app.save_settings_quietly();
         }
@@ -193,17 +259,16 @@ fn draw_filter_row(ui: &mut egui::Ui, app: &mut WatcherApp) {
 fn draw_sort_row(ui: &mut egui::Ui, app: &mut WatcherApp) {
     ui.horizontal_wrapped(|ui| {
         ui.label("Sort");
-        if ui
-            .selectable_label(app.sort == SortPreset::VramDesc, "VRAM High")
-            .clicked()
-        {
-            app.set_sort(SortPreset::VramDesc);
-        }
-        if ui
-            .selectable_label(app.sort == SortPreset::RamDesc, "RAM High")
-            .clicked()
-        {
-            app.set_sort(SortPreset::RamDesc);
+        let mut sort = app.sort;
+        egui::ComboBox::from_id_source("sort_preset")
+            .selected_text(sort.display_name())
+            .show_ui(ui, |ui| {
+                for preset in SortPreset::ALL {
+                    ui.selectable_value(&mut sort, preset, preset.display_name());
+                }
+            });
+        if sort != app.sort {
+            app.set_sort(sort);
         }
 
         ui.separator();
@@ -222,11 +287,23 @@ fn draw_sort_row(ui: &mut egui::Ui, app: &mut WatcherApp) {
         }
 
         ui.separator();
+        let stats = app.visible_process_stats();
+        ui.label(format!("Rows: {} / {}", stats.rows, app.processes.len()));
+        ui.separator();
         ui.label(format!(
-            "Rows: {} / Total: {}",
-            app.visible_process_count(),
-            app.processes.len()
+            "RAM {}  |  VRAM {}  |  GPU {}  |  Web {}",
+            formatter::bytes_to_compact_text(stats.ram_bytes),
+            formatter::bytes_to_compact_text(stats.vram_bytes),
+            stats.gpu_processes,
+            stats.local_web_processes
         ));
+        if let Some(delta) = app.snapshot_delta {
+            ui.separator();
+            ui.label(format!(
+                "Snapshot +{} / -{} / {} changed",
+                delta.started, delta.exited, delta.changed
+            ));
+        }
         if let Some(pid) = app.selected_pid {
             ui.separator();
             ui.label(format!("Selected PID: {pid}"));
@@ -236,7 +313,7 @@ fn draw_sort_row(ui: &mut egui::Ui, app: &mut WatcherApp) {
 
 fn quick_filter_button(ui: &mut egui::Ui, app: &mut WatcherApp, filter: QuickFilter, label: &str) {
     if ui
-        .selectable_label(app.active_quick_filter() == filter, label)
+        .selectable_label(app.quick_filter_active(filter), label)
         .clicked()
     {
         app.apply_quick_filter(filter);
@@ -262,6 +339,10 @@ fn draw_status_bar(ui: &mut egui::Ui, app: &WatcherApp) {
         if !app.listener_status.is_empty() {
             ui.separator();
             ui.label(&app.listener_status);
+        }
+        if !app.timing_status.is_empty() {
+            ui.separator();
+            ui.label(&app.timing_status);
         }
     });
 }
@@ -310,6 +391,35 @@ fn draw_pending_dialog(ctx: &egui::Context, app: &mut WatcherApp) {
         .default_width(620.0)
         .show(ctx, |ui| {
             ui.label(description);
+            let ram_total = targets.iter().fold(0_u64, |total, process| {
+                total.saturating_add(process.ram_bytes)
+            });
+            let vram_total = targets.iter().fold(0_u64, |total, process| {
+                total.saturating_add(process.vram_bytes().unwrap_or(0))
+            });
+            let endpoint_count = targets
+                .iter()
+                .map(|process| process.local_endpoints.len())
+                .sum::<usize>();
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(format!("{} target(s)", targets.len()));
+                ui.separator();
+                ui.label(format!(
+                    "Snapshot RAM {}",
+                    formatter::bytes_to_compact_text(ram_total)
+                ));
+                ui.separator();
+                ui.label(format!(
+                    "Known VRAM {}",
+                    formatter::bytes_to_compact_text(vram_total)
+                ));
+                ui.separator();
+                ui.label(format!("Local Web {endpoint_count}"));
+            })
+            .response
+            .on_hover_text(
+                "Snapshot totals are informational; actual reclaimed memory can differ.",
+            );
             ui.add_space(6.0);
             egui::ScrollArea::vertical()
                 .max_height(260.0)

@@ -1,5 +1,5 @@
 use crate::collectors::process_collector;
-use crate::model::{ProcessInfo, ProcessSnapshot, SortPreset};
+use crate::model::{ProcessInfo, ProcessSnapshot, SnapshotState, SortPreset};
 use crate::services::process_identity;
 use crate::settings::{Settings, TableView};
 use crate::ui;
@@ -22,6 +22,8 @@ pub struct WatcherApp {
     pub status: String,
     pub vram_status: String,
     pub listener_status: String,
+    pub timing_status: String,
+    pub snapshot_delta: Option<SnapshotDeltaSummary>,
     pub last_updated: Option<SystemTime>,
     pub loading: bool,
     pub selected_pid: Option<u32>,
@@ -32,8 +34,29 @@ pub struct WatcherApp {
     pub python_keywords_text: String,
     pub codex_root_keywords_text: String,
     pub focus_search_requested: bool,
+    pub settings_dirty: bool,
     load_receiver: Option<Receiver<anyhow::Result<ProcessSnapshot>>>,
     last_auto_refresh: Instant,
+    scheduled_reload_at: Option<Instant>,
+    table_scroll_request: Option<usize>,
+    screenshot_path: Option<PathBuf>,
+    screenshot_receiver: Option<Receiver<anyhow::Result<PathBuf>>>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SnapshotDeltaSummary {
+    pub started: usize,
+    pub exited: usize,
+    pub changed: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VisibleProcessStats {
+    pub rows: usize,
+    pub ram_bytes: u64,
+    pub vram_bytes: u64,
+    pub gpu_processes: usize,
+    pub local_web_processes: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +75,7 @@ pub enum QuickFilter {
     CodexTerminal,
     HeavyRam,
     HeavyVram,
+    Changed,
 }
 
 impl Default for WatcherApp {
@@ -78,6 +102,8 @@ impl Default for WatcherApp {
             status,
             vram_status: String::new(),
             listener_status: String::new(),
+            timing_status: String::new(),
+            snapshot_delta: None,
             last_updated: None,
             loading: false,
             selected_pid: None,
@@ -88,22 +114,33 @@ impl Default for WatcherApp {
             python_keywords_text,
             codex_root_keywords_text,
             focus_search_requested: false,
+            settings_dirty: false,
             load_receiver: None,
             last_auto_refresh: Instant::now(),
+            scheduled_reload_at: None,
+            table_scroll_request: None,
+            screenshot_path: None,
+            screenshot_receiver: None,
         }
     }
 }
 
 impl eframe::App for WatcherApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_screenshot_result();
         self.handle_keyboard_shortcuts(ctx);
         self.poll_load();
         self.maybe_auto_refresh(ctx);
         ui::draw(ctx, self);
+        self.maybe_add_screenshot_callback(ctx);
     }
 }
 
 impl WatcherApp {
+    pub fn set_screenshot_path(&mut self, path: PathBuf) {
+        self.screenshot_path = Some(path);
+    }
+
     pub fn start_load(&mut self, ctx: &egui::Context) {
         if self.loading {
             return;
@@ -111,7 +148,7 @@ impl WatcherApp {
 
         self.loading = true;
         self.status = "Loading process snapshot...".to_string();
-        self.last_auto_refresh = Instant::now();
+        self.scheduled_reload_at = None;
         let settings = self.settings.clone();
         let (sender, receiver) = mpsc::channel();
         self.load_receiver = Some(receiver);
@@ -128,6 +165,7 @@ impl WatcherApp {
         self.sort = sort;
         self.settings.default_sort = sort.as_settings_value().to_string();
         sort_processes(&mut self.processes, self.sort);
+        self.scroll_selection_into_view();
         self.save_settings_quietly();
     }
 
@@ -136,8 +174,14 @@ impl WatcherApp {
         self.save_settings_quietly();
     }
 
+    pub fn set_auto_refresh_enabled(&mut self, enabled: bool) {
+        self.settings.set_auto_refresh_enabled(enabled);
+        self.last_auto_refresh = Instant::now();
+        self.save_settings_quietly();
+    }
+
     pub fn visible_process_indices(&self) -> Vec<usize> {
-        let query = self.search.trim().to_lowercase();
+        let query = SearchQuery::parse(&self.search);
         self.processes
             .iter()
             .enumerate()
@@ -148,16 +192,26 @@ impl WatcherApp {
             .collect()
     }
 
-    pub fn visible_process_count(&self) -> usize {
-        let query = self.search.trim().to_lowercase();
+    pub fn visible_process_stats(&self) -> VisibleProcessStats {
+        let query = SearchQuery::parse(&self.search);
+        let mut stats = VisibleProcessStats::default();
         self.processes
             .iter()
             .filter(|process| self.process_matches_filters(process, &query))
-            .count()
+            .for_each(|process| {
+                stats.rows += 1;
+                stats.ram_bytes = stats.ram_bytes.saturating_add(process.ram_bytes);
+                if let Some(vram) = process.vram_bytes() {
+                    stats.vram_bytes = stats.vram_bytes.saturating_add(vram);
+                }
+                stats.gpu_processes += usize::from(process.is_gpu_active());
+                stats.local_web_processes += usize::from(!process.local_endpoints.is_empty());
+            });
+        stats
     }
 
     pub fn selected_process(&self) -> Option<&ProcessInfo> {
-        let query = self.search.trim().to_lowercase();
+        let query = SearchQuery::parse(&self.search);
         self.selected_pid.and_then(|pid| {
             self.processes
                 .iter()
@@ -176,32 +230,225 @@ impl WatcherApp {
         requested
     }
 
+    pub fn take_table_scroll_request(&mut self) -> Option<usize> {
+        self.table_scroll_request.take()
+    }
+
+    pub fn select_pid(&mut self, pid: u32) {
+        let rows = self.visible_process_indices();
+        if let Some(position) = rows
+            .iter()
+            .position(|index| self.processes[*index].pid == pid)
+        {
+            self.selected_pid = Some(pid);
+            self.table_scroll_request = Some(position);
+        }
+    }
+
     pub fn apply_quick_filter(&mut self, filter: QuickFilter) {
-        self.settings.python_only = filter == QuickFilter::Python;
-        self.settings.gpu_active_only = filter == QuickFilter::GpuActive;
-        self.settings.codex_related_only = filter == QuickFilter::CodexTerminal;
-        self.settings.local_web_only = filter == QuickFilter::LocalWeb;
-        self.settings.heavy_ram_only = filter == QuickFilter::HeavyRam;
-        self.settings.heavy_vram_only = filter == QuickFilter::HeavyVram;
+        toggle_quick_filter(&mut self.settings, filter);
+        self.scroll_selection_into_view();
         self.save_settings_quietly();
     }
 
-    pub fn active_quick_filter(&self) -> QuickFilter {
-        if self.settings.python_only {
-            QuickFilter::Python
-        } else if self.settings.gpu_active_only {
-            QuickFilter::GpuActive
-        } else if self.settings.local_web_only {
-            QuickFilter::LocalWeb
-        } else if self.settings.codex_related_only {
-            QuickFilter::CodexTerminal
-        } else if self.settings.heavy_ram_only {
-            QuickFilter::HeavyRam
-        } else if self.settings.heavy_vram_only {
-            QuickFilter::HeavyVram
-        } else {
-            QuickFilter::All
+    pub fn quick_filter_active(&self, filter: QuickFilter) -> bool {
+        match filter {
+            QuickFilter::All => !self.has_active_quick_filters(),
+            QuickFilter::Python => self.settings.python_only,
+            QuickFilter::GpuActive => self.settings.gpu_active_only,
+            QuickFilter::LocalWeb => self.settings.local_web_only,
+            QuickFilter::CodexTerminal => self.settings.codex_related_only,
+            QuickFilter::HeavyRam => self.settings.heavy_ram_only,
+            QuickFilter::HeavyVram => self.settings.heavy_vram_only,
+            QuickFilter::Changed => self.settings.memory_changed_only,
         }
+    }
+
+    pub fn has_active_quick_filters(&self) -> bool {
+        self.settings.python_only
+            || self.settings.gpu_active_only
+            || self.settings.local_web_only
+            || self.settings.codex_related_only
+            || self.settings.heavy_ram_only
+            || self.settings.heavy_vram_only
+            || self.settings.memory_changed_only
+    }
+
+    pub fn copy_visible_tsv(&mut self, ctx: &egui::Context) {
+        let rows = self.visible_process_indices();
+        let mut lines = Vec::with_capacity(rows.len() + 1);
+        lines.push(
+            "State\tScope\tPID\tProcess Name\tRAM MB\tRAM Delta MB\tVRAM MB\tVRAM Delta MB\tAge\tParent PID\tParent Name\tLocal Web\tExecutable Path\tCommand Line"
+                .to_string(),
+        );
+        for index in rows {
+            let process = &self.processes[index];
+            lines.push(
+                [
+                    process.snapshot_state.to_string(),
+                    process.scope.to_string(),
+                    process.pid.to_string(),
+                    process.name.clone(),
+                    crate::services::formatter::bytes_to_mb_text(process.ram_bytes),
+                    crate::services::formatter::optional_delta_mb_text(process.ram_delta_bytes),
+                    crate::services::formatter::optional_bytes_to_mb_text(process.vram_bytes()),
+                    crate::services::formatter::optional_delta_mb_text(process.vram_delta_bytes),
+                    crate::services::formatter::age_text(process.start_time),
+                    process
+                        .parent_pid
+                        .map(|pid| pid.to_string())
+                        .unwrap_or_default(),
+                    process.parent_name.clone().unwrap_or_default(),
+                    process.local_web_summary(),
+                    process.exe_path.clone().unwrap_or_default(),
+                    process.command_line.clone().unwrap_or_default(),
+                ]
+                .into_iter()
+                .map(|value| sanitize_tsv_field(&value))
+                .collect::<Vec<_>>()
+                .join("\t"),
+            );
+        }
+        let count = lines.len().saturating_sub(1);
+        ctx.copy_text(lines.join("\r\n"));
+        self.status = format!("Copied {count} visible process row(s) as TSV.");
+    }
+
+    pub fn copy_visible_pids(&mut self, ctx: &egui::Context) {
+        let pids = self
+            .visible_process_indices()
+            .into_iter()
+            .map(|index| self.processes[index].pid.to_string())
+            .collect::<Vec<_>>();
+        let count = pids.len();
+        ctx.copy_text(pids.join("\r\n"));
+        self.status = format!("Copied {count} visible PID(s).");
+    }
+
+    pub fn copy_diagnostics(&mut self, ctx: &egui::Context) {
+        let stats = self.visible_process_stats();
+        let text = [
+            format!("RunScope {}", env!("CARGO_PKG_VERSION")),
+            format!("Architecture: {}", std::env::consts::ARCH),
+            format!(
+                "Processes: {} total, {} visible",
+                self.processes.len(),
+                stats.rows
+            ),
+            format!("Sort: {}", self.sort.display_name()),
+            format!("Table view: {}", self.settings.table_view),
+            format!(
+                "Refresh: {} ({} ms)",
+                if self.settings.auto_refresh_enabled() {
+                    "auto"
+                } else {
+                    "manual"
+                },
+                self.settings.auto_refresh_interval_ms
+            ),
+            format!("VRAM backend: {}", empty_as_unavailable(&self.vram_status)),
+            format!(
+                "Local listeners: {}",
+                empty_as_unavailable(&self.listener_status)
+            ),
+            format!("Timing: {}", empty_as_unavailable(&self.timing_status)),
+            format!("Settings: {}", self.settings_path.to_string_lossy()),
+        ]
+        .join("\r\n");
+        ctx.copy_text(text);
+        self.status = "Copied diagnostics.".to_string();
+    }
+
+    pub fn copy_selected_json(&mut self, ctx: &egui::Context) {
+        let Some(process) = self.selected_process().cloned() else {
+            self.status = "No process selected.".to_string();
+            return;
+        };
+        let value = serde_json::json!({
+            "snapshot_state": process.snapshot_state.to_string(),
+            "scope": process.scope.to_string(),
+            "pid": process.pid,
+            "name": process.name,
+            "ram_bytes": process.ram_bytes,
+            "ram_delta_bytes": process.ram_delta_bytes,
+            "vram_bytes": process.vram_bytes(),
+            "vram_delta_bytes": process.vram_delta_bytes,
+            "virtual_memory_bytes": process.virtual_memory_bytes,
+            "parent_pid": process.parent_pid,
+            "parent_name": process.parent_name,
+            "executable_path": process.exe_path,
+            "command_line": process.command_line,
+            "working_directory": process.cwd,
+            "start_time_unix_seconds": process.start_time.and_then(|time| {
+                time.duration_since(std::time::UNIX_EPOCH).ok().map(|duration| duration.as_secs())
+            }),
+            "protected": process.protected,
+            "protection_reason": process.protection_reason,
+            "python_related": process.python_related,
+            "codex_related": process.codex_related,
+            "local_endpoints": process.local_endpoints.iter().map(|endpoint| serde_json::json!({
+                "bind_address": endpoint.bind_address,
+                "port": endpoint.port,
+                "url": endpoint.url,
+            })).collect::<Vec<_>>(),
+            "gpu": process.gpu.as_ref().map(|gpu| serde_json::json!({
+                "device_indices": gpu.device_indices,
+                "device_names": gpu.device_names,
+                "vram_bytes": gpu.vram_bytes,
+                "process_type": format!("{:?}", gpu.process_type),
+            })),
+        });
+        match serde_json::to_string_pretty(&value) {
+            Ok(text) => {
+                ctx.copy_text(text);
+                self.status = format!("Copied PID {} as JSON.", process.pid);
+            }
+            Err(error) => {
+                self.status = format!("Failed to serialize selected process: {error}");
+            }
+        }
+    }
+
+    pub fn move_selection(&mut self, amount: isize) {
+        let rows = self.visible_process_indices();
+        if rows.is_empty() {
+            self.selected_pid = None;
+            return;
+        }
+        let current = self.selected_pid.and_then(|pid| {
+            rows.iter()
+                .position(|index| self.processes[*index].pid == pid)
+        });
+        let next = match current {
+            Some(current) => current
+                .saturating_add_signed(amount)
+                .min(rows.len().saturating_sub(1)),
+            None if amount < 0 => rows.len() - 1,
+            None => 0,
+        };
+        self.selected_pid = Some(self.processes[rows[next]].pid);
+        self.table_scroll_request = Some(next);
+    }
+
+    pub fn move_selection_to_edge(&mut self, end: bool) {
+        let rows = self.visible_process_indices();
+        if rows.is_empty() {
+            self.selected_pid = None;
+            return;
+        }
+        let position = if end { rows.len() - 1 } else { 0 };
+        self.selected_pid = Some(self.processes[rows[position]].pid);
+        self.table_scroll_request = Some(position);
+    }
+
+    fn scroll_selection_into_view(&mut self) {
+        let Some(pid) = self.selected_pid else {
+            return;
+        };
+        let rows = self.visible_process_indices();
+        self.table_scroll_request = rows
+            .iter()
+            .position(|index| self.processes[*index].pid == pid);
     }
 
     pub fn open_selected_local_web(&mut self, ctx: &egui::Context) {
@@ -268,6 +515,26 @@ impl WatcherApp {
         }
     }
 
+    pub fn open_selected_working_directory(&mut self) {
+        let Some(process) = self.selected_process() else {
+            self.status = "No process selected.".to_string();
+            return;
+        };
+        let Some(cwd) = process.cwd.as_deref() else {
+            self.status = format!("PID {} has no working directory.", process.pid);
+            return;
+        };
+        let pid = process.pid;
+        match Command::new("explorer.exe").arg(cwd).spawn() {
+            Ok(_) => {
+                self.status = format!("Opened working directory for PID {pid}.");
+            }
+            Err(error) => {
+                self.status = format!("Failed to open working directory: {error}");
+            }
+        }
+    }
+
     pub fn request_kill_selected(&mut self) {
         let Some(process) = self.selected_process().cloned() else {
             self.status = "No process selected.".to_string();
@@ -291,7 +558,7 @@ impl WatcherApp {
             self.status = format!("PID {} is protected.", root.pid);
             return;
         }
-        let current_processes =
+        let mut current_processes =
             match process_collector::collect_processes_for_action(&self.settings) {
                 Ok(processes) => processes,
                 Err(error) => {
@@ -299,6 +566,7 @@ impl WatcherApp {
                     return;
                 }
             };
+        enrich_action_processes(&mut current_processes, &self.processes);
         let Some(current_root) = current_processes
             .iter()
             .find(|candidate| candidate.pid == root.pid)
@@ -371,9 +639,10 @@ impl WatcherApp {
                 match crate::services::terminator::close_process(current) {
                     Ok(count) => {
                         self.status = format!(
-                            "WM_CLOSE sent to {count} window(s) for PID {}.",
+                            "WM_CLOSE sent to {count} window(s) for PID {}. Reload scheduled.",
                             process.pid
                         );
+                        self.schedule_reload(ctx, Duration::from_millis(900));
                     }
                     Err(error) => {
                         self.status = format!("Close failed for PID {}: {error}", process.pid);
@@ -409,8 +678,8 @@ impl WatcherApp {
                 }
                 match crate::services::terminator::kill_process(current) {
                     Ok(()) => {
-                        self.status = format!("Killed PID {}.", process.pid);
-                        self.start_load(ctx);
+                        self.status = format!("Killed PID {}. Reload scheduled.", process.pid);
+                        self.schedule_reload(ctx, Duration::from_millis(120));
                     }
                     Err(error) => {
                         self.status = format!("Kill failed for PID {}: {error}", process.pid);
@@ -423,7 +692,7 @@ impl WatcherApp {
                     return;
                 };
                 let root_pid = root.pid;
-                let current_processes =
+                let mut current_processes =
                     match process_collector::collect_processes_for_action(&self.settings) {
                         Ok(processes) => processes,
                         Err(error) => {
@@ -431,6 +700,7 @@ impl WatcherApp {
                             return;
                         }
                     };
+                enrich_action_processes(&mut current_processes, &self.processes);
                 let Some(current_root) = current_processes
                     .iter()
                     .find(|candidate| candidate.pid == root_pid)
@@ -464,10 +734,10 @@ impl WatcherApp {
                 match crate::services::terminator::kill_tree(&current_targets) {
                     Ok(killed) => {
                         self.status = format!(
-                            "Killed process tree rooted at PID {root_pid}: {:?}.",
+                            "Killed process tree rooted at PID {root_pid}: {:?}. Reload scheduled.",
                             killed
                         );
-                        self.start_load(ctx);
+                        self.schedule_reload(ctx, Duration::from_millis(120));
                     }
                     Err(error) => {
                         self.status = format!("Kill Tree failed for root PID {root_pid}: {error}");
@@ -492,7 +762,12 @@ impl WatcherApp {
 
     pub fn open_settings_window(&mut self) {
         self.sync_settings_editor();
+        self.settings_dirty = false;
         self.show_settings = true;
+    }
+
+    pub fn mark_settings_dirty(&mut self) {
+        self.settings_dirty = true;
     }
 
     pub fn save_settings_from_editor(&mut self) {
@@ -500,7 +775,10 @@ impl WatcherApp {
         self.settings.python_keywords = vec_from_lines(&self.python_keywords_text);
         self.settings.codex_root_keywords = vec_from_lines(&self.codex_root_keywords_text);
         self.settings.default_sort = self.sort.as_settings_value().to_string();
+        self.reclassify_current_processes();
+        self.last_auto_refresh = Instant::now();
         if self.save_settings_quietly() {
+            self.settings_dirty = false;
             self.status = "Settings saved.".to_string();
         }
     }
@@ -510,8 +788,11 @@ impl WatcherApp {
             Ok(settings) => {
                 self.settings = settings;
                 self.sort = SortPreset::from_settings(&self.settings.default_sort);
+                self.reclassify_current_processes();
                 sort_processes(&mut self.processes, self.sort);
                 self.sync_settings_editor();
+                self.last_auto_refresh = Instant::now();
+                self.settings_dirty = false;
                 self.status = "Settings reloaded.".to_string();
             }
             Err(error) => {
@@ -523,9 +804,12 @@ impl WatcherApp {
     pub fn reset_settings_to_default(&mut self) {
         self.settings = Settings::default();
         self.sort = SortPreset::from_settings(&self.settings.default_sort);
+        self.reclassify_current_processes();
         sort_processes(&mut self.processes, self.sort);
         self.sync_settings_editor();
+        self.last_auto_refresh = Instant::now();
         if self.save_settings_quietly() {
+            self.settings_dirty = false;
             self.status = "Settings reset to defaults.".to_string();
         }
     }
@@ -550,6 +834,14 @@ impl WatcherApp {
         self.codex_root_keywords_text = lines_from_vec(&self.settings.codex_root_keywords);
     }
 
+    fn reclassify_current_processes(&mut self) {
+        crate::services::scope_detector::assign_scopes(&mut self.processes, &self.settings);
+        for process in &mut self.processes {
+            process.refresh_searchable_text();
+        }
+        self.scroll_selection_into_view();
+    }
+
     fn poll_load(&mut self) {
         let mut received = None;
         if let Some(receiver) = &self.load_receiver {
@@ -568,18 +860,54 @@ impl WatcherApp {
 
         self.load_receiver = None;
         self.loading = false;
+        self.last_auto_refresh = Instant::now();
         match result {
             Ok(snapshot) => {
-                self.processes = snapshot.processes;
+                let selected_identity = self.selected_pid.and_then(|pid| {
+                    self.processes
+                        .iter()
+                        .find(|process| process.pid == pid)
+                        .cloned()
+                });
+                let mut processes = snapshot.processes;
+                self.snapshot_delta = apply_snapshot_deltas(
+                    &self.processes,
+                    &mut processes,
+                    self.last_updated.is_some(),
+                );
+                crate::services::scope_detector::assign_scopes(&mut processes, &self.settings);
+                for process in &mut processes {
+                    process.refresh_searchable_text();
+                }
+                self.processes = processes;
                 sort_processes(&mut self.processes, self.sort);
                 self.last_updated = Some(SystemTime::now());
                 self.vram_status = snapshot.vram_status;
                 self.listener_status = snapshot.listener_status;
-                self.status = format!("Loaded {} processes.", self.processes.len());
-                if let Some(pid) = self.selected_pid {
-                    if !self.processes.iter().any(|process| process.pid == pid) {
+                self.timing_status = snapshot.timing_status;
+                self.status = match self.snapshot_delta {
+                    Some(delta) => format!(
+                        "Loaded {} processes. Snapshot: +{} started, -{} exited, {} changed.",
+                        self.processes.len(),
+                        delta.started,
+                        delta.exited,
+                        delta.changed
+                    ),
+                    None => format!("Loaded {} processes.", self.processes.len()),
+                };
+                if let Some(expected) = selected_identity {
+                    if !self.processes.iter().any(|process| {
+                        process.pid == expected.pid
+                            && process_identity::same_process(&expected, process)
+                    }) {
                         self.selected_pid = None;
                     }
+                }
+                if self.selected_pid.is_none() && self.screenshot_path.is_some() {
+                    self.selected_pid = self
+                        .visible_process_indices()
+                        .first()
+                        .map(|index| self.processes[*index].pid);
                 }
             }
             Err(error) => {
@@ -589,17 +917,88 @@ impl WatcherApp {
     }
 
     fn maybe_auto_refresh(&mut self, ctx: &egui::Context) {
-        if !self.settings.auto_refresh_enabled() || self.loading {
+        if self.loading {
+            return;
+        }
+        if let Some(deadline) = self.scheduled_reload_at {
+            let now = Instant::now();
+            if now >= deadline {
+                self.start_load(ctx);
+            } else {
+                ctx.request_repaint_after(deadline.saturating_duration_since(now));
+            }
+            return;
+        }
+        if !self.settings.auto_refresh_enabled()
+            || self.pending_action.is_some()
+            || self.show_settings
+        {
             return;
         }
         let interval = Duration::from_millis(self.settings.auto_refresh_interval_ms.max(1000));
-        if self.last_auto_refresh.elapsed() >= interval {
+        let elapsed = self.last_auto_refresh.elapsed();
+        if elapsed >= interval {
             self.start_load(ctx);
+        } else {
+            ctx.request_repaint_after(interval - elapsed);
         }
-        ctx.request_repaint_after(Duration::from_millis(250));
     }
 
-    fn process_matches_filters(&self, process: &ProcessInfo, query: &str) -> bool {
+    fn schedule_reload(&mut self, ctx: &egui::Context, delay: Duration) {
+        self.scheduled_reload_at = Some(Instant::now() + delay);
+        ctx.request_repaint_after(delay);
+    }
+
+    fn maybe_add_screenshot_callback(&mut self, ctx: &egui::Context) {
+        if self.loading || self.screenshot_receiver.is_some() {
+            return;
+        }
+        let Some(path) = self.screenshot_path.take() else {
+            return;
+        };
+        let (sender, receiver) = mpsc::channel();
+        self.screenshot_receiver = Some(receiver);
+        let repaint = ctx.clone();
+        let callback = eframe::egui_glow::CallbackFn::new(move |info, painter| {
+            let image = painter.read_screen_rgba(info.screen_size_px);
+            let result =
+                crate::services::screenshot::save_bmp(&image, &path).map(|()| path.clone());
+            let _ = sender.send(result);
+            repaint.request_repaint();
+        });
+        ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("runscope_screenshot_callback"),
+        ))
+        .add(egui::PaintCallback {
+            rect: ctx.screen_rect(),
+            callback: std::sync::Arc::new(callback),
+        });
+    }
+
+    fn poll_screenshot_result(&mut self) {
+        let Some(receiver) = &self.screenshot_receiver else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(path)) => {
+                self.status = format!("Saved screenshot to {}.", path.to_string_lossy());
+                self.screenshot_receiver = None;
+            }
+            Ok(Err(error)) => {
+                self.status = format!("Failed to save screenshot: {error}");
+                self.screenshot_receiver = None;
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.status =
+                    "Failed to save screenshot: render callback disconnected.".to_string();
+                self.screenshot_receiver = None;
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+    }
+
+    fn process_matches_filters(&self, process: &ProcessInfo, query: &SearchQuery) -> bool {
         if !self.settings.show_system_processes && process.protected {
             return false;
         }
@@ -626,7 +1025,15 @@ impl WatcherApp {
         {
             return false;
         }
-        if !query.is_empty() && !process.searchable_text_lower.contains(query) {
+        if self.settings.memory_changed_only
+            && !matches!(
+                process.snapshot_state,
+                SnapshotState::New | SnapshotState::Changed
+            )
+        {
+            return false;
+        }
+        if !query.matches(process) {
             return false;
         }
         true
@@ -644,6 +1051,11 @@ impl WatcherApp {
             self.start_load(ctx);
         }
 
+        let reload_shortcut = egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::R);
+        if ctx.input_mut(|input| input.consume_shortcut(&reload_shortcut)) {
+            self.start_load(ctx);
+        }
+
         let focus_shortcut = egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::F);
         if ctx.input_mut(|input| input.consume_shortcut(&focus_shortcut)) {
             self.focus_search_requested = true;
@@ -653,6 +1065,35 @@ impl WatcherApp {
             return;
         }
 
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)) {
+            self.move_selection(1);
+        }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)) {
+            self.move_selection(-1);
+        }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::PageDown)) {
+            self.move_selection(10);
+        }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::PageUp)) {
+            self.move_selection(-10);
+        }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Home)) {
+            self.move_selection_to_edge(false);
+        }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::End)) {
+            self.move_selection_to_edge(true);
+        }
+
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            if !self.search.is_empty() {
+                self.search.clear();
+                self.status = "Search cleared.".to_string();
+            } else if self.has_active_quick_filters() {
+                self.apply_quick_filter(QuickFilter::All);
+                self.status = "Quick filter cleared.".to_string();
+            }
+        }
+
         if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
             self.open_selected_local_web(ctx);
         }
@@ -660,6 +1101,14 @@ impl WatcherApp {
         let copy_shortcut = egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::C);
         if ctx.input_mut(|input| input.consume_shortcut(&copy_shortcut)) {
             self.copy_selected_summary(ctx);
+        }
+
+        let copy_table_shortcut = egui::KeyboardShortcut::new(
+            egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+            egui::Key::C,
+        );
+        if ctx.input_mut(|input| input.consume_shortcut(&copy_table_shortcut)) {
+            self.copy_visible_tsv(ctx);
         }
 
         if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Delete)) {
@@ -672,6 +1121,194 @@ fn lines_from_vec(values: &[String]) -> String {
     values.join("\n")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchField {
+    Any,
+    Pid,
+    Name,
+    Scope,
+    Path,
+    Command,
+    Parent,
+    Port,
+    Web,
+    State,
+    Ram,
+    Vram,
+}
+
+#[derive(Debug, Clone)]
+struct SearchTerm {
+    field: SearchField,
+    value: String,
+    excluded: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SearchQuery {
+    terms: Vec<SearchTerm>,
+}
+
+impl SearchQuery {
+    fn parse(query: &str) -> Self {
+        let terms = split_search_tokens(query)
+            .into_iter()
+            .filter_map(|raw| {
+                let (excluded, raw) = raw
+                    .strip_prefix('-')
+                    .map(|value| (true, value))
+                    .unwrap_or((false, raw.as_str()));
+                if raw.is_empty() {
+                    return None;
+                }
+                let (field, value) = match raw.split_once(':') {
+                    Some((field, value)) => match field.to_ascii_lowercase().as_str() {
+                        "pid" => (SearchField::Pid, value),
+                        "name" => (SearchField::Name, value),
+                        "scope" => (SearchField::Scope, value),
+                        "path" => (SearchField::Path, value),
+                        "cmd" | "command" => (SearchField::Command, value),
+                        "parent" => (SearchField::Parent, value),
+                        "port" => (SearchField::Port, value),
+                        "web" | "url" => (SearchField::Web, value),
+                        "state" => (SearchField::State, value),
+                        "ram" => (SearchField::Ram, value),
+                        "vram" => (SearchField::Vram, value),
+                        _ => (SearchField::Any, raw),
+                    },
+                    None => (SearchField::Any, raw),
+                };
+                (!value.is_empty()).then(|| SearchTerm {
+                    field,
+                    value: value.to_lowercase(),
+                    excluded,
+                })
+            })
+            .collect();
+        Self { terms }
+    }
+
+    fn matches(&self, process: &ProcessInfo) -> bool {
+        self.terms.iter().all(|term| {
+            let matched = match term.field {
+                SearchField::Any => process.searchable_text_lower.contains(&term.value),
+                SearchField::Pid => process.pid.to_string() == term.value,
+                SearchField::Name => process.name.to_lowercase().contains(&term.value),
+                SearchField::Scope => process
+                    .scope
+                    .to_string()
+                    .to_lowercase()
+                    .contains(&term.value),
+                SearchField::Path => process
+                    .exe_path
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_lowercase()
+                    .contains(&term.value),
+                SearchField::Command => process
+                    .command_line
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_lowercase()
+                    .contains(&term.value),
+                SearchField::Parent => {
+                    process
+                        .parent_name
+                        .as_deref()
+                        .unwrap_or_default()
+                        .to_lowercase()
+                        .contains(&term.value)
+                        || process
+                            .parent_pid
+                            .is_some_and(|pid| pid.to_string() == term.value)
+                }
+                SearchField::Port => process
+                    .local_endpoints
+                    .iter()
+                    .any(|endpoint| endpoint.port.to_string() == term.value),
+                SearchField::Web => process
+                    .local_endpoints
+                    .iter()
+                    .any(|endpoint| endpoint.url.to_lowercase().contains(&term.value)),
+                SearchField::State => process
+                    .snapshot_state
+                    .to_string()
+                    .to_lowercase()
+                    .contains(&term.value),
+                SearchField::Ram => numeric_mb_matches(process.ram_bytes, &term.value),
+                SearchField::Vram => process
+                    .vram_bytes()
+                    .is_some_and(|bytes| numeric_mb_matches(bytes, &term.value)),
+            };
+            matched != term.excluded
+        })
+    }
+}
+
+fn split_search_tokens(query: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut quoted = false;
+    for character in query.chars() {
+        match character {
+            '"' => quoted = !quoted,
+            character if character.is_whitespace() && !quoted => {
+                if !token.is_empty() {
+                    tokens.push(std::mem::take(&mut token));
+                }
+            }
+            character => token.push(character),
+        }
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    tokens
+}
+
+fn numeric_mb_matches(bytes: u64, expression: &str) -> bool {
+    let (operator, value) = if let Some(value) = expression.strip_prefix(">=") {
+        (">=", value)
+    } else if let Some(value) = expression.strip_prefix("<=") {
+        ("<=", value)
+    } else if let Some(value) = expression.strip_prefix('>') {
+        (">", value)
+    } else if let Some(value) = expression.strip_prefix('<') {
+        ("<", value)
+    } else if let Some(value) = expression.strip_prefix('=') {
+        ("=", value)
+    } else {
+        (">=", expression)
+    };
+    let Ok(megabytes) = value.parse::<f64>() else {
+        return false;
+    };
+    if !megabytes.is_finite() || megabytes < 0.0 {
+        return false;
+    }
+    let actual = bytes as f64 / 1024.0 / 1024.0;
+    match operator {
+        ">=" => actual >= megabytes,
+        "<=" => actual <= megabytes,
+        ">" => actual > megabytes,
+        "<" => actual < megabytes,
+        "=" => (actual - megabytes).abs() < 0.05,
+        _ => false,
+    }
+}
+
+fn sanitize_tsv_field(value: &str) -> String {
+    value.replace(['\t', '\r', '\n'], " ")
+}
+
+fn empty_as_unavailable(value: &str) -> &str {
+    if value.is_empty() {
+        "not loaded"
+    } else {
+        value
+    }
+}
+
 fn vec_from_lines(text: &str) -> Vec<String> {
     text.lines()
         .map(str::trim)
@@ -682,6 +1319,107 @@ fn vec_from_lines(text: &str) -> Vec<String> {
 
 fn mb_to_bytes(value: u64) -> u64 {
     value.saturating_mul(1024 * 1024)
+}
+
+fn toggle_quick_filter(settings: &mut Settings, filter: QuickFilter) {
+    match filter {
+        QuickFilter::All => {
+            settings.python_only = false;
+            settings.gpu_active_only = false;
+            settings.codex_related_only = false;
+            settings.local_web_only = false;
+            settings.heavy_ram_only = false;
+            settings.heavy_vram_only = false;
+            settings.memory_changed_only = false;
+        }
+        QuickFilter::Python => settings.python_only = !settings.python_only,
+        QuickFilter::GpuActive => settings.gpu_active_only = !settings.gpu_active_only,
+        QuickFilter::LocalWeb => settings.local_web_only = !settings.local_web_only,
+        QuickFilter::CodexTerminal => {
+            settings.codex_related_only = !settings.codex_related_only;
+        }
+        QuickFilter::HeavyRam => settings.heavy_ram_only = !settings.heavy_ram_only,
+        QuickFilter::HeavyVram => settings.heavy_vram_only = !settings.heavy_vram_only,
+        QuickFilter::Changed => settings.memory_changed_only = !settings.memory_changed_only,
+    }
+}
+
+fn apply_snapshot_deltas(
+    previous: &[ProcessInfo],
+    current: &mut [ProcessInfo],
+    has_baseline: bool,
+) -> Option<SnapshotDeltaSummary> {
+    if !has_baseline {
+        return None;
+    }
+
+    let previous_by_pid = previous
+        .iter()
+        .map(|process| (process.pid, process))
+        .collect::<HashMap<_, _>>();
+    let mut matched_previous = HashSet::new();
+    let mut summary = SnapshotDeltaSummary::default();
+    for process in current {
+        let Some(previous) = previous_by_pid
+            .get(&process.pid)
+            .copied()
+            .filter(|previous| process_identity::same_process(previous, process))
+        else {
+            process.snapshot_state = SnapshotState::New;
+            summary.started += 1;
+            continue;
+        };
+
+        matched_previous.insert(previous.pid);
+        process.ram_delta_bytes = Some(signed_byte_delta(process.ram_bytes, previous.ram_bytes));
+        process.vram_delta_bytes = match (process.vram_bytes(), previous.vram_bytes()) {
+            (Some(current), Some(previous)) => Some(signed_byte_delta(current, previous)),
+            _ => None,
+        };
+        let changed = process.ram_delta_bytes != Some(0)
+            || process.vram_delta_bytes.is_some_and(|delta| delta != 0);
+        process.snapshot_state = if changed {
+            summary.changed += 1;
+            SnapshotState::Changed
+        } else {
+            SnapshotState::Unchanged
+        };
+    }
+    summary.exited = previous
+        .iter()
+        .filter(|process| !matched_previous.contains(&process.pid))
+        .count();
+    Some(summary)
+}
+
+fn enrich_action_processes(current: &mut [ProcessInfo], loaded: &[ProcessInfo]) {
+    let loaded_by_pid = loaded
+        .iter()
+        .map(|process| (process.pid, process))
+        .collect::<HashMap<_, _>>();
+    for process in current {
+        let Some(loaded) = loaded_by_pid
+            .get(&process.pid)
+            .copied()
+            .filter(|loaded| process_identity::same_process(loaded, process))
+        else {
+            continue;
+        };
+        process.gpu = loaded.gpu.clone();
+        process.local_endpoints = loaded.local_endpoints.clone();
+        process.ram_delta_bytes = loaded.ram_delta_bytes;
+        process.vram_delta_bytes = loaded.vram_delta_bytes;
+        process.snapshot_state = loaded.snapshot_state;
+        process.refresh_searchable_text();
+    }
+}
+
+fn signed_byte_delta(current: u64, previous: u64) -> i64 {
+    if current >= previous {
+        current.saturating_sub(previous).min(i64::MAX as u64) as i64
+    } else {
+        -(previous.saturating_sub(current).min(i64::MAX as u64) as i64)
+    }
 }
 
 fn explorer_select(path: &str) -> Command {
@@ -714,7 +1452,20 @@ fn process_summary(process: &ProcessInfo) -> String {
             "Age: {}",
             crate::services::formatter::age_text(process.start_time)
         ),
+        format!("Snapshot State: {}", process.snapshot_state),
     ];
+    if process.ram_delta_bytes.is_some() {
+        lines.push(format!(
+            "RAM Delta: {} MB",
+            crate::services::formatter::optional_delta_mb_text(process.ram_delta_bytes)
+        ));
+    }
+    if process.vram_delta_bytes.is_some() {
+        lines.push(format!(
+            "VRAM Delta: {} MB",
+            crate::services::formatter::optional_delta_mb_text(process.vram_delta_bytes)
+        ));
+    }
     if let Some(parent_pid) = process.parent_pid {
         lines.push(format!(
             "Parent: {} ({parent_pid})",
@@ -767,37 +1518,122 @@ fn collect_tree(
 
 pub fn sort_processes(processes: &mut [ProcessInfo], sort: SortPreset) {
     match sort {
+        SortPreset::RamAsc => processes.sort_by(|left, right| {
+            left.ram_bytes
+                .cmp(&right.ram_bytes)
+                .then_with(|| process_tie_breaker(left, right))
+        }),
         SortPreset::RamDesc => processes.sort_by(|left, right| {
             right
                 .ram_bytes
                 .cmp(&left.ram_bytes)
-                .then_with(|| left.name.cmp(&right.name))
+                .then_with(|| process_tie_breaker(left, right))
+        }),
+        SortPreset::VramAsc => processes.sort_by(|left, right| {
+            compare_optional_bytes(left.vram_bytes(), right.vram_bytes(), false)
+                .then_with(|| left.ram_bytes.cmp(&right.ram_bytes))
+                .then_with(|| process_tie_breaker(left, right))
+        }),
+        SortPreset::VramDesc => processes.sort_by(|left, right| {
+            compare_optional_bytes(left.vram_bytes(), right.vram_bytes(), true)
+                .then_with(|| right.ram_bytes.cmp(&left.ram_bytes))
+                .then_with(|| process_tie_breaker(left, right))
+        }),
+        SortPreset::NameAsc => processes.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
                 .then_with(|| left.pid.cmp(&right.pid))
         }),
-        SortPreset::VramDesc => {
-            processes.sort_by(
-                |left, right| match (left.vram_bytes(), right.vram_bytes()) {
-                    (Some(left_vram), Some(right_vram)) => right_vram
-                        .cmp(&left_vram)
-                        .then_with(|| right.ram_bytes.cmp(&left.ram_bytes))
-                        .then_with(|| left.name.cmp(&right.name))
-                        .then_with(|| left.pid.cmp(&right.pid)),
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => right
-                        .ram_bytes
-                        .cmp(&left.ram_bytes)
-                        .then_with(|| left.name.cmp(&right.name))
-                        .then_with(|| left.pid.cmp(&right.pid)),
-                },
-            )
+        SortPreset::NameDesc => processes.sort_by(|left, right| {
+            right
+                .name
+                .cmp(&left.name)
+                .then_with(|| left.pid.cmp(&right.pid))
+        }),
+        SortPreset::PidAsc => processes.sort_by_key(|process| process.pid),
+        SortPreset::PidDesc => {
+            processes.sort_by_key(|process| std::cmp::Reverse(process.pid));
         }
+        SortPreset::AgeNewest => processes.sort_by(|left, right| {
+            compare_optional_time(left.start_time, right.start_time, true)
+                .then_with(|| process_tie_breaker(left, right))
+        }),
+        SortPreset::AgeOldest => processes.sort_by(|left, right| {
+            compare_optional_time(left.start_time, right.start_time, false)
+                .then_with(|| process_tie_breaker(left, right))
+        }),
+        SortPreset::RamGrowth => processes.sort_by(|left, right| {
+            compare_optional_delta(left.ram_delta_bytes, right.ram_delta_bytes)
+                .then_with(|| process_tie_breaker(left, right))
+        }),
+        SortPreset::VramGrowth => processes.sort_by(|left, right| {
+            compare_optional_delta(left.vram_delta_bytes, right.vram_delta_bytes)
+                .then_with(|| process_tie_breaker(left, right))
+        }),
+    }
+}
+
+fn process_tie_breaker(left: &ProcessInfo, right: &ProcessInfo) -> std::cmp::Ordering {
+    left.name
+        .cmp(&right.name)
+        .then_with(|| left.pid.cmp(&right.pid))
+}
+
+fn compare_optional_bytes(
+    left: Option<u64>,
+    right: Option<u64>,
+    descending: bool,
+) -> std::cmp::Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) if descending => right.cmp(&left),
+        (Some(left), Some(right)) => left.cmp(&right),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+fn compare_optional_delta(left: Option<i64>, right: Option<i64>) -> std::cmp::Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => right.cmp(&left),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+fn compare_optional_time(
+    left: Option<SystemTime>,
+    right: Option<SystemTime>,
+    newest_first: bool,
+) -> std::cmp::Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) if newest_first => right.cmp(&left),
+        (Some(left), Some(right)) => left.cmp(&right),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{ListeningEndpoint, ProcessScope};
+    use std::time::{Duration, UNIX_EPOCH};
+
+    fn process(pid: u32, name: &str, start_seconds: u64, ram_mb: u64) -> ProcessInfo {
+        let mut process = ProcessInfo {
+            pid,
+            name: name.to_string(),
+            exe_path: Some(format!(r"C:\Program Files\{name}")),
+            start_time: Some(UNIX_EPOCH + Duration::from_secs(start_seconds)),
+            ram_bytes: mb_to_bytes(ram_mb),
+            ..Default::default()
+        };
+        process.refresh_searchable_text();
+        process
+    }
 
     #[test]
     fn filtered_out_selection_cannot_be_resolved_or_terminated() {
@@ -838,5 +1674,112 @@ mod tests {
             app.pending_action,
             Some(PendingAction::Close { ref targets }) if targets.len() == 1 && targets[0].pid == 42
         ));
+    }
+
+    #[test]
+    fn structured_search_supports_fields_quotes_numeric_ranges_and_exclusions() {
+        let mut process = process(42, "python.exe", 100, 2048);
+        process.command_line = Some("python server.py --mode production".to_string());
+        process.parent_name = Some("Code.exe".to_string());
+        process.scope = ProcessScope::Python;
+        process.snapshot_state = SnapshotState::Changed;
+        process.local_endpoints =
+            vec![ListeningEndpoint::new("127.0.0.1".to_string(), 7860, false)];
+        process.refresh_searchable_text();
+
+        assert!(SearchQuery::parse(
+            r#"name:python path:"program files" parent:code port:7860 ram:>1024 -cmd:test state:changed"#
+        )
+        .matches(&process));
+        assert!(!SearchQuery::parse("pid:4").matches(&process));
+        assert!(!SearchQuery::parse("vram:>0").matches(&process));
+        assert!(!SearchQuery::parse("-cmd:production").matches(&process));
+    }
+
+    #[test]
+    fn quick_filters_toggle_independently_and_all_clears_them() {
+        let mut settings = Settings::default();
+
+        toggle_quick_filter(&mut settings, QuickFilter::Python);
+        toggle_quick_filter(&mut settings, QuickFilter::LocalWeb);
+        assert!(settings.python_only);
+        assert!(settings.local_web_only);
+
+        toggle_quick_filter(&mut settings, QuickFilter::Python);
+        assert!(!settings.python_only);
+        assert!(settings.local_web_only);
+
+        toggle_quick_filter(&mut settings, QuickFilter::All);
+        assert!(!settings.local_web_only);
+        assert!(!settings.memory_changed_only);
+    }
+
+    #[test]
+    fn snapshot_delta_tracks_started_exited_and_changed_by_identity() {
+        let previous = vec![
+            process(10, "python.exe", 100, 100),
+            process(20, "node.exe", 100, 50),
+        ];
+        let mut current = vec![
+            process(10, "python.exe", 100, 140),
+            process(30, "cargo.exe", 100, 25),
+        ];
+
+        let summary = apply_snapshot_deltas(&previous, &mut current, true).unwrap();
+
+        assert_eq!(summary.started, 1);
+        assert_eq!(summary.exited, 1);
+        assert_eq!(summary.changed, 1);
+        assert_eq!(current[0].ram_delta_bytes, Some(mb_to_bytes(40) as i64));
+        assert_eq!(current[0].snapshot_state, SnapshotState::Changed);
+        assert_eq!(current[1].snapshot_state, SnapshotState::New);
+    }
+
+    #[test]
+    fn snapshot_delta_treats_reused_pid_as_exit_and_start() {
+        let previous = vec![process(10, "python.exe", 100, 100)];
+        let mut current = vec![process(10, "python.exe", 101, 100)];
+
+        let summary = apply_snapshot_deltas(&previous, &mut current, true).unwrap();
+
+        assert_eq!(summary.started, 1);
+        assert_eq!(summary.exited, 1);
+        assert_eq!(summary.changed, 0);
+        assert_eq!(current[0].ram_delta_bytes, None);
+        assert_eq!(current[0].snapshot_state, SnapshotState::New);
+    }
+
+    #[test]
+    fn growth_sort_places_known_largest_growth_first() {
+        let mut processes = vec![
+            ProcessInfo {
+                pid: 1,
+                name: "shrinking".to_string(),
+                ram_delta_bytes: Some(-10),
+                ..Default::default()
+            },
+            ProcessInfo {
+                pid: 2,
+                name: "unknown".to_string(),
+                ram_delta_bytes: None,
+                ..Default::default()
+            },
+            ProcessInfo {
+                pid: 3,
+                name: "growing".to_string(),
+                ram_delta_bytes: Some(20),
+                ..Default::default()
+            },
+        ];
+
+        sort_processes(&mut processes, SortPreset::RamGrowth);
+
+        assert_eq!(
+            processes
+                .iter()
+                .map(|process| process.pid)
+                .collect::<Vec<_>>(),
+            vec![3, 1, 2]
+        );
     }
 }

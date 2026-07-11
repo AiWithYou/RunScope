@@ -3,23 +3,35 @@ use std::ffi::{c_char, c_void, CStr};
 use std::ptr::null_mut;
 
 use anyhow::{bail, Context};
-use windows::core::{s, PCSTR};
-use windows::Win32::Foundation::{FreeLibrary, HMODULE};
-use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
+use windows::core::{w, PCSTR};
+use windows::Win32::Foundation::{FreeLibrary, HANDLE, HMODULE};
+use windows::Win32::System::LibraryLoader::{
+    GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
+};
 
 use crate::model::GpuProcessType;
 
 #[derive(Debug, Clone)]
 pub struct VramUsage {
     pub bytes: u64,
-    pub device_name: String,
+    pub device_indices: Vec<u32>,
+    pub device_names: Vec<String>,
     pub process_type: GpuProcessType,
+}
+
+#[derive(Debug, Clone)]
+struct DeviceVramUsage {
+    bytes: u64,
+    device_name: String,
+    process_type: GpuProcessType,
 }
 
 type NvmlReturn = i32;
 type NvmlDevice = *mut c_void;
 
 const NVML_SUCCESS: NvmlReturn = 0;
+const NVML_ERROR_NOT_SUPPORTED: NvmlReturn = 3;
+const NVML_ERROR_INSUFFICIENT_SIZE: NvmlReturn = 7;
 const NVML_VALUE_NOT_AVAILABLE: u64 = u64::MAX;
 
 #[repr(C)]
@@ -45,7 +57,14 @@ struct NvmlLibrary {
 
 impl NvmlLibrary {
     fn load() -> anyhow::Result<Self> {
-        let module = unsafe { LoadLibraryA(s!("nvml.dll")) }.context("nvml.dll not found")?;
+        let module = unsafe {
+            LoadLibraryExW(
+                w!("nvml.dll"),
+                HANDLE::default(),
+                LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+        }
+        .context("nvml.dll not found in Windows System32")?;
         Ok(Self { module })
     }
 
@@ -84,19 +103,15 @@ pub fn collect_vram_by_pid_nvml() -> anyhow::Result<HashMap<u32, VramUsage>> {
 
         check(init(), "nvmlInit_v2")?;
 
-        let mut result = HashMap::new();
         let collect_result = collect_devices(
             device_count,
             handle_by_index,
             device_name,
             compute_processes,
             graphics_processes,
-            &mut result,
         );
         let _ = shutdown();
-        collect_result?;
-
-        Ok(result)
+        collect_result
     }
 }
 
@@ -106,10 +121,10 @@ unsafe fn collect_devices(
     device_name: NvmlDeviceGetName,
     compute_processes: NvmlDeviceGetRunningProcesses,
     graphics_processes: NvmlDeviceGetRunningProcesses,
-    result: &mut HashMap<u32, VramUsage>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<HashMap<u32, VramUsage>> {
     let mut count = 0;
     check(device_count(&mut count), "nvmlDeviceGetCount_v2")?;
+    let mut per_device = HashMap::new();
 
     for index in 0..count {
         let mut device: NvmlDevice = null_mut();
@@ -118,15 +133,21 @@ unsafe fn collect_devices(
         }
         let name = read_device_name(device_name, device).unwrap_or_else(|| "NVIDIA".to_string());
 
-        for info in read_processes(device, compute_processes) {
-            add_usage(result, info, &name, GpuProcessType::Compute);
+        for info in read_processes(device, compute_processes, "compute")? {
+            add_device_usage(&mut per_device, index, info, &name, GpuProcessType::Compute);
         }
-        for info in read_processes(device, graphics_processes) {
-            add_usage(result, info, &name, GpuProcessType::Graphics);
+        for info in read_processes(device, graphics_processes, "graphics")? {
+            add_device_usage(
+                &mut per_device,
+                index,
+                info,
+                &name,
+                GpuProcessType::Graphics,
+            );
         }
     }
 
-    Ok(())
+    Ok(collapse_device_usage(per_device))
 }
 
 unsafe fn read_device_name(device_name: NvmlDeviceGetName, device: NvmlDevice) -> Option<String> {
@@ -144,23 +165,40 @@ unsafe fn read_device_name(device_name: NvmlDeviceGetName, device: NvmlDevice) -
 unsafe fn read_processes(
     device: NvmlDevice,
     reader: NvmlDeviceGetRunningProcesses,
-) -> Vec<NvmlProcessInfo> {
+    label: &str,
+) -> anyhow::Result<Vec<NvmlProcessInfo>> {
     let mut count = 0;
-    let _ = reader(device, &mut count, null_mut());
+    let first_result = reader(device, &mut count, null_mut());
+    if first_result == NVML_ERROR_NOT_SUPPORTED {
+        return Ok(Vec::new());
+    }
+    if first_result != NVML_SUCCESS && first_result != NVML_ERROR_INSUFFICIENT_SIZE {
+        bail!("NVML {label} process size query failed with code {first_result}");
+    }
     if count == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
-    let mut processes = vec![NvmlProcessInfo::default(); count as usize];
-    if reader(device, &mut count, processes.as_mut_ptr()) != NVML_SUCCESS {
-        return Vec::new();
+    for _ in 0..3 {
+        let mut processes = vec![NvmlProcessInfo::default(); count as usize];
+        let result = reader(device, &mut count, processes.as_mut_ptr());
+        if result == NVML_SUCCESS {
+            processes.truncate(count as usize);
+            return Ok(processes);
+        }
+        if result == NVML_ERROR_NOT_SUPPORTED {
+            return Ok(Vec::new());
+        }
+        if result != NVML_ERROR_INSUFFICIENT_SIZE {
+            bail!("NVML {label} process query failed with code {result}");
+        }
     }
-    processes.truncate(count as usize);
-    processes
+    bail!("NVML {label} process list kept resizing during collection")
 }
 
-fn add_usage(
-    result: &mut HashMap<u32, VramUsage>,
+fn add_device_usage(
+    result: &mut HashMap<(u32, u32), DeviceVramUsage>,
+    device_index: u32,
     info: NvmlProcessInfo,
     device_name: &str,
     process_type: GpuProcessType,
@@ -173,16 +211,45 @@ fn add_usage(
     }
 
     result
-        .entry(info.pid)
+        .entry((info.pid, device_index))
         .and_modify(|current| {
-            current.bytes = current.bytes.saturating_add(info.used_gpu_memory);
+            current.bytes = current.bytes.max(info.used_gpu_memory);
             current.process_type = merge_process_type(current.process_type, process_type);
         })
-        .or_insert_with(|| VramUsage {
+        .or_insert_with(|| DeviceVramUsage {
             bytes: info.used_gpu_memory,
             device_name: device_name.to_string(),
             process_type,
         });
+}
+
+fn collapse_device_usage(
+    per_device: HashMap<(u32, u32), DeviceVramUsage>,
+) -> HashMap<u32, VramUsage> {
+    let mut result = HashMap::new();
+    for ((pid, device_index), usage) in per_device {
+        result
+            .entry(pid)
+            .and_modify(|current: &mut VramUsage| {
+                current.bytes = current.bytes.saturating_add(usage.bytes);
+                current.device_indices.push(device_index);
+                current.device_names.push(usage.device_name.clone());
+                current.process_type = merge_process_type(current.process_type, usage.process_type);
+            })
+            .or_insert_with(|| VramUsage {
+                bytes: usage.bytes,
+                device_indices: vec![device_index],
+                device_names: vec![usage.device_name],
+                process_type: usage.process_type,
+            });
+    }
+    for usage in result.values_mut() {
+        usage.device_indices.sort_unstable();
+        usage.device_indices.dedup();
+        usage.device_names.sort();
+        usage.device_names.dedup();
+    }
+    result
 }
 
 fn merge_process_type(current: GpuProcessType, next: GpuProcessType) -> GpuProcessType {
@@ -201,5 +268,38 @@ fn check(code: NvmlReturn, operation: &str) -> anyhow::Result<()> {
         Ok(())
     } else {
         bail!("{operation} failed with NVML code {code}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compute_and_graphics_rows_on_same_device_are_not_double_counted() {
+        let mut per_device = HashMap::new();
+        let info = NvmlProcessInfo {
+            pid: 42,
+            used_gpu_memory: 100,
+            ..Default::default()
+        };
+        add_device_usage(&mut per_device, 0, info, "GPU A", GpuProcessType::Compute);
+        add_device_usage(&mut per_device, 0, info, "GPU A", GpuProcessType::Graphics);
+        add_device_usage(
+            &mut per_device,
+            1,
+            NvmlProcessInfo {
+                used_gpu_memory: 50,
+                ..info
+            },
+            "GPU B",
+            GpuProcessType::Compute,
+        );
+
+        let usage = collapse_device_usage(per_device).remove(&42).unwrap();
+        assert_eq!(usage.bytes, 150);
+        assert_eq!(usage.device_indices, vec![0, 1]);
+        assert_eq!(usage.device_names, vec!["GPU A", "GPU B"]);
+        assert_eq!(usage.process_type, GpuProcessType::Both);
     }
 }
