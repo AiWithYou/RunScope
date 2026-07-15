@@ -10,8 +10,19 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
+
+type LoadResult = anyhow::Result<(ProcessSnapshot, Settings)>;
+
+struct LoadRequest {
+    settings: Settings,
+    response: mpsc::Sender<LoadResult>,
+    repaint: egui::Context,
+}
+
+static LOAD_WORKER: OnceLock<Result<mpsc::SyncSender<LoadRequest>, String>> = OnceLock::new();
 
 pub struct WatcherApp {
     pub settings: Settings,
@@ -35,7 +46,7 @@ pub struct WatcherApp {
     pub codex_root_keywords_text: String,
     pub focus_search_requested: bool,
     pub settings_dirty: bool,
-    load_receiver: Option<Receiver<anyhow::Result<(ProcessSnapshot, Settings)>>>,
+    load_receiver: Option<Receiver<LoadResult>>,
     last_auto_refresh: Instant,
     scheduled_reload_at: Option<Instant>,
     table_scroll_request: Option<usize>,
@@ -143,6 +154,28 @@ impl Default for WatcherApp {
     }
 }
 
+fn load_worker() -> anyhow::Result<&'static mpsc::SyncSender<LoadRequest>> {
+    let worker = LOAD_WORKER.get_or_init(|| {
+        let (request_sender, request_receiver) = mpsc::sync_channel::<LoadRequest>(1);
+        thread::Builder::new()
+            .name("runscope-snapshot".to_string())
+            .spawn(move || {
+                while let Ok(request) = request_receiver.recv() {
+                    let settings = request.settings;
+                    let result = process_collector::collect_processes(&settings)
+                        .map(|snapshot| (snapshot, settings));
+                    let _ = request.response.send(result);
+                    request.repaint.request_repaint();
+                }
+            })
+            .map(|_| request_sender)
+            .map_err(|error| error.to_string())
+    });
+    worker
+        .as_ref()
+        .map_err(|error| anyhow!("failed to start snapshot worker: {error}"))
+}
+
 impl eframe::App for WatcherApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_screenshot_result();
@@ -164,20 +197,35 @@ impl WatcherApp {
             return;
         }
 
-        self.loading = true;
-        self.status = "Loading process snapshot...".to_string();
+        self.last_auto_refresh = Instant::now();
         self.scheduled_reload_at = None;
         let settings = self.settings.clone();
-        let (sender, receiver) = mpsc::channel();
-        self.load_receiver = Some(receiver);
-        let repaint = ctx.clone();
-
-        thread::spawn(move || {
-            let result = process_collector::collect_processes(&settings)
-                .map(|snapshot| (snapshot, settings));
-            let _ = sender.send(result);
-            repaint.request_repaint();
-        });
+        let (response, receiver) = mpsc::channel();
+        let request = LoadRequest {
+            settings,
+            response,
+            repaint: ctx.clone(),
+        };
+        let worker = match load_worker() {
+            Ok(worker) => worker,
+            Err(error) => {
+                self.status = format!("Load worker unavailable: {error}");
+                return;
+            }
+        };
+        match worker.try_send(request) {
+            Ok(()) => {
+                self.loading = true;
+                self.status = "Loading process snapshot...".to_string();
+                self.load_receiver = Some(receiver);
+            }
+            Err(mpsc::TrySendError::Full(_)) => {
+                self.status = "Load worker is still busy.".to_string();
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                self.status = "Load worker disconnected.".to_string();
+            }
+        }
     }
 
     pub fn set_sort(&mut self, sort: SortPreset) {
