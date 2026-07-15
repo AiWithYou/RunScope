@@ -3,8 +3,16 @@ use crate::model::ProcessInfo;
 use crate::services::formatter;
 use std::collections::{HashMap, HashSet};
 
-pub fn draw(ui: &mut egui::Ui, ctx: &egui::Context, app: &mut WatcherApp) {
-    let Some(process) = app.selected_process().cloned() else {
+pub fn draw(ui: &mut egui::Ui, ctx: &egui::Context, app: &mut WatcherApp, rows: &[usize]) {
+    let visible_selection = app.selected_pid.and_then(|pid| {
+        rows.iter()
+            .map(|index| &app.processes[*index])
+            .find(|process| process.pid == pid)
+    });
+    let Some(process) = visible_selection
+        .or_else(|| app.selected_process())
+        .cloned()
+    else {
         ui.label("Select a process row to inspect details and use process actions.");
         return;
     };

@@ -44,7 +44,7 @@ pub fn collect_processes(settings: &Settings) -> anyhow::Result<ProcessSnapshot>
         (vram, listeners)
     });
     let process_started = Instant::now();
-    let processes = collect_process_infos(settings, &vram_by_pid, &listeners_by_pid);
+    let processes = collect_process_infos(settings, vram_by_pid, listeners_by_pid);
     let process_elapsed = process_started.elapsed();
 
     Ok(ProcessSnapshot {
@@ -72,15 +72,15 @@ fn duration_text(duration: Duration) -> String {
 pub fn collect_processes_for_action(settings: &Settings) -> anyhow::Result<Vec<ProcessInfo>> {
     Ok(collect_process_infos(
         settings,
-        &HashMap::new(),
-        &HashMap::new(),
+        HashMap::new(),
+        HashMap::new(),
     ))
 }
 
 fn collect_process_infos(
     settings: &Settings,
-    vram_by_pid: &HashMap<u32, gpu_nvml::VramUsage>,
-    listeners_by_pid: &HashMap<u32, Vec<crate::model::ListeningEndpoint>>,
+    mut vram_by_pid: HashMap<u32, gpu_nvml::VramUsage>,
+    mut listeners_by_pid: HashMap<u32, Vec<crate::model::ListeningEndpoint>>,
 ) -> Vec<ProcessInfo> {
     let mut system = System::new();
     system.refresh_processes_specifics(
@@ -92,11 +92,11 @@ fn collect_process_infos(
     );
 
     let mut processes = Vec::with_capacity(system.processes().len());
-    let mut names_by_pid = HashMap::new();
 
     for (pid, process) in system.processes() {
         let pid_u32 = pid.as_u32();
         let parent_pid = process.parent().map(|parent| parent.as_u32());
+        let name = process.name().to_string();
         let command_line = non_empty(process.cmd().join(" "));
         let exe_path = process.exe().map(|path| path.to_string_lossy().to_string());
         let cwd = process.cwd().map(|path| path.to_string_lossy().to_string());
@@ -106,11 +106,9 @@ fn collect_process_infos(
             None
         };
 
-        names_by_pid.insert(pid_u32, process.name().to_string());
-
-        let gpu = vram_by_pid.get(&pid_u32).map(|usage| GpuProcessInfo {
-            device_indices: usage.device_indices.clone(),
-            device_names: usage.device_names.clone(),
+        let gpu = vram_by_pid.remove(&pid_u32).map(|usage| GpuProcessInfo {
+            device_indices: usage.device_indices,
+            device_names: usage.device_names,
             vram_bytes: Some(usage.bytes),
             process_type: usage.process_type,
         });
@@ -119,7 +117,7 @@ fn collect_process_infos(
             pid: pid_u32,
             parent_pid,
             parent_name: None,
-            name: process.name().to_string(),
+            name,
             exe_path,
             command_line,
             cwd,
@@ -130,7 +128,7 @@ fn collect_process_infos(
             vram_delta_bytes: None,
             snapshot_state: SnapshotState::Unavailable,
             gpu,
-            local_endpoints: listeners_by_pid.get(&pid_u32).cloned().unwrap_or_default(),
+            local_endpoints: listeners_by_pid.remove(&pid_u32).unwrap_or_default(),
             children: Vec::new(),
             scope: Default::default(),
             protected: false,
@@ -141,17 +139,11 @@ fn collect_process_infos(
         });
     }
 
-    let start_times_by_pid = processes
-        .iter()
-        .map(|process| (process.pid, process.start_time))
-        .collect::<HashMap<_, _>>();
+    retain_verified_parent_relations(&mut processes);
+
     let mut children_by_parent: HashMap<u32, Vec<u32>> = HashMap::new();
     for process in &processes {
-        let Some(parent_pid) = process.parent_pid else {
-            continue;
-        };
-        let parent_start_time = start_times_by_pid.get(&parent_pid).copied().flatten();
-        if verified_parent_relation(parent_start_time, process.start_time) {
+        if let Some(parent_pid) = process.parent_pid {
             children_by_parent
                 .entry(parent_pid)
                 .or_default()
@@ -159,18 +151,27 @@ fn collect_process_infos(
         }
     }
 
-    for process in &mut processes {
-        process.parent_name = process
+    let index_by_pid = processes
+        .iter()
+        .enumerate()
+        .map(|(index, process)| (process.pid, index))
+        .collect::<HashMap<_, _>>();
+    for index in 0..processes.len() {
+        let parent_name = processes[index]
             .parent_pid
-            .and_then(|pid| names_by_pid.get(&pid).cloned());
-        process.children = children_by_parent.remove(&process.pid).unwrap_or_default();
-        process.children.sort_unstable();
+            .and_then(|pid| index_by_pid.get(&pid))
+            .map(|parent_index| processes[*parent_index].name.clone());
+        let mut children = children_by_parent
+            .remove(&processes[index].pid)
+            .unwrap_or_default();
+        children.sort_unstable();
+        processes[index].parent_name = parent_name;
+        processes[index].children = children;
     }
 
     scope_detector::assign_scopes(&mut processes, settings);
-    for process in &mut processes {
-        process.refresh_searchable_text();
-    }
+    // The UI builds the search index after applying snapshot delta state. Action snapshots do not
+    // use the index, so building it here would duplicate work on every visible reload.
 
     processes
 }
@@ -189,39 +190,35 @@ fn collect_listeners() -> (HashMap<u32, Vec<crate::model::ListeningEndpoint>>, S
 }
 
 fn collect_vram() -> (HashMap<u32, gpu_nvml::VramUsage>, String) {
-    let nvml_result = collect_nvml_with_timeout(Duration::from_millis(1000));
-    if let Ok(map) = &nvml_result {
-        if !map.is_empty() {
-            return (map.clone(), "VRAM: NVML".to_string());
-        }
-    }
+    let nvml_result = match collect_nvml_with_timeout(Duration::from_millis(1000)) {
+        Ok(map) if !map.is_empty() => return (map, "VRAM: NVML".to_string()),
+        result => result,
+    };
 
-    let windows_perf_result = gpu_windows_perf::collect_vram_by_pid_windows_perf();
-    if let Ok(map) = &windows_perf_result {
-        return (
-            map.clone(),
-            match &nvml_result {
+    let windows_perf_result = match gpu_windows_perf::collect_vram_by_pid_windows_perf() {
+        Ok(map) if !map.is_empty() => {
+            let status = match &nvml_result {
                 Ok(_) => "VRAM: Windows GPU Process Memory (NVML returned no per-process memory)"
                     .to_string(),
                 Err(error) => {
                     format!("VRAM: Windows GPU Process Memory (NVML unavailable: {error})")
                 }
-            },
-        );
-    }
-
-    let smi_result = gpu_nvidia_smi::collect_vram_by_pid();
-    if let Ok(map) = &smi_result {
-        if !map.is_empty() {
-            return (
-                map.clone(),
-                match &nvml_result {
-                    Ok(_) => "VRAM: nvidia-smi (NVML returned no per-process memory)".to_string(),
-                    Err(error) => format!("VRAM: nvidia-smi (NVML unavailable: {error})"),
-                },
-            );
+            };
+            return (map, status);
         }
-    }
+        result => result,
+    };
+
+    let smi_result = match gpu_nvidia_smi::collect_vram_by_pid() {
+        Ok(map) if !map.is_empty() => {
+            let status = match &nvml_result {
+                Ok(_) => "VRAM: nvidia-smi (NVML returned no per-process memory)".to_string(),
+                Err(error) => format!("VRAM: nvidia-smi (NVML unavailable: {error})"),
+            };
+            return (map, status);
+        }
+        result => result,
+    };
 
     let nvml_status = match nvml_result {
         Ok(_) => "NVML returned no per-process memory".to_string(),
@@ -304,6 +301,24 @@ fn verified_parent_relation(
     )
 }
 
+fn retain_verified_parent_relations(processes: &mut [ProcessInfo]) {
+    let start_times_by_pid = processes
+        .iter()
+        .map(|process| (process.pid, process.start_time))
+        .collect::<HashMap<_, _>>();
+    for process in processes {
+        let Some(parent_pid) = process.parent_pid else {
+            continue;
+        };
+        let parent_start_time = start_times_by_pid.get(&parent_pid).copied().flatten();
+        if parent_pid == process.pid
+            || !verified_parent_relation(parent_start_time, process.start_time)
+        {
+            process.parent_pid = None;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,9 +339,6 @@ mod tests {
             current.protection_reason.as_deref(),
             Some("Current RunScope process")
         );
-        assert!(current
-            .searchable_text_lower
-            .contains(&current.pid.to_string()));
     }
 
     #[test]
@@ -352,5 +364,42 @@ mod tests {
 
         assert!(verified_parent_relation(Some(parent), Some(child)));
         assert!(verified_parent_relation(Some(parent), Some(parent)));
+    }
+
+    #[test]
+    fn removes_unverified_and_self_referencing_parent_metadata() {
+        let parent_start = UNIX_EPOCH + Duration::from_secs(200);
+        let child_start = UNIX_EPOCH + Duration::from_secs(100);
+        let mut processes = vec![
+            ProcessInfo {
+                pid: 10,
+                start_time: Some(parent_start),
+                ..Default::default()
+            },
+            ProcessInfo {
+                pid: 20,
+                parent_pid: Some(10),
+                start_time: Some(child_start),
+                ..Default::default()
+            },
+            ProcessInfo {
+                pid: 30,
+                parent_pid: Some(30),
+                start_time: Some(parent_start),
+                ..Default::default()
+            },
+            ProcessInfo {
+                pid: 40,
+                parent_pid: Some(10),
+                start_time: Some(parent_start + Duration::from_secs(1)),
+                ..Default::default()
+            },
+        ];
+
+        retain_verified_parent_relations(&mut processes);
+
+        assert_eq!(processes[1].parent_pid, None);
+        assert_eq!(processes[2].parent_pid, None);
+        assert_eq!(processes[3].parent_pid, Some(10));
     }
 }

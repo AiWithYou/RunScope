@@ -29,8 +29,7 @@ enum TableAction {
     KillTree(u32),
 }
 
-pub fn draw(ui: &mut egui::Ui, app: &mut WatcherApp, max_height: f32) {
-    let rows = app.visible_process_indices();
+pub fn draw(ui: &mut egui::Ui, app: &mut WatcherApp, max_height: f32, rows: &[usize]) {
     let advanced = app.settings.table_view == TableView::Advanced;
     let mut selected_pid = app
         .selected_pid
@@ -335,7 +334,7 @@ fn draw_process_row(
 
     let local_web_rect = next_rect(rect, &mut x, LOCAL_WEB_WIDTH);
     let local_web_text = process.local_web_table_text();
-    let local_web_url = process.primary_local_web_url().map(str::to_string);
+    let local_web_url = process.primary_local_web_url();
     paint_text(
         ui,
         local_web_rect,
@@ -414,13 +413,13 @@ fn draw_process_row(
     if response.double_clicked() {
         *selected_pid = Some(process.pid);
         if let Some(url) = local_web_url {
-            ui.ctx().open_url(egui::OpenUrl::new_tab(&url));
+            ui.ctx().open_url(egui::OpenUrl::new_tab(url));
         }
     } else if response.clicked() {
         *selected_pid = Some(process.pid);
         if hovered_local_web {
             if let Some(url) = local_web_url {
-                ui.ctx().open_url(egui::OpenUrl::new_tab(&url));
+                ui.ctx().open_url(egui::OpenUrl::new_tab(url));
             }
         }
     }
@@ -468,7 +467,7 @@ fn paint_text(
 
 fn paint_scope_badge(ui: &mut egui::Ui, rect: egui::Rect, scope: ProcessScope, selected: bool) {
     let (fill, stroke, text_color) = scope_badge_style(scope, selected);
-    let label = scope.to_string();
+    let label = scope.as_str();
     let badge_width = ((label.chars().count() as f32 * 7.0) + 18.0).min(rect.width() - 12.0);
     let badge_rect = egui::Rect::from_min_size(
         egui::pos2(rect.left() + CELL_PAD_X, rect.top() + 5.0),

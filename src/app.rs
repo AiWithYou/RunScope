@@ -35,7 +35,7 @@ pub struct WatcherApp {
     pub codex_root_keywords_text: String,
     pub focus_search_requested: bool,
     pub settings_dirty: bool,
-    load_receiver: Option<Receiver<anyhow::Result<ProcessSnapshot>>>,
+    load_receiver: Option<Receiver<anyhow::Result<(ProcessSnapshot, Settings)>>>,
     last_auto_refresh: Instant,
     scheduled_reload_at: Option<Instant>,
     table_scroll_request: Option<usize>,
@@ -57,6 +57,24 @@ pub struct VisibleProcessStats {
     pub vram_bytes: u64,
     pub gpu_processes: usize,
     pub local_web_processes: usize,
+}
+
+impl VisibleProcessStats {
+    fn add(&mut self, process: &ProcessInfo) {
+        self.rows += 1;
+        self.ram_bytes = self.ram_bytes.saturating_add(process.ram_bytes);
+        if let Some(vram) = process.vram_bytes() {
+            self.vram_bytes = self.vram_bytes.saturating_add(vram);
+        }
+        self.gpu_processes += usize::from(process.is_gpu_active());
+        self.local_web_processes += usize::from(!process.local_endpoints.is_empty());
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct VisibleProcessView {
+    pub indices: Vec<usize>,
+    pub stats: VisibleProcessStats,
 }
 
 #[derive(Debug, Clone)]
@@ -155,7 +173,8 @@ impl WatcherApp {
         let repaint = ctx.clone();
 
         thread::spawn(move || {
-            let result = process_collector::collect_processes(&settings);
+            let result = process_collector::collect_processes(&settings)
+                .map(|snapshot| (snapshot, settings));
             let _ = sender.send(result);
             repaint.request_repaint();
         });
@@ -181,43 +200,42 @@ impl WatcherApp {
     }
 
     pub fn visible_process_indices(&self) -> Vec<usize> {
+        self.visible_process_view().indices
+    }
+
+    pub fn visible_process_view(&self) -> VisibleProcessView {
         let query = SearchQuery::parse(&self.search);
-        self.processes
-            .iter()
-            .enumerate()
-            .filter_map(|(index, process)| {
-                self.process_matches_filters(process, &query)
-                    .then_some(index)
-            })
-            .collect()
+        let mut view = VisibleProcessView {
+            indices: Vec::with_capacity(self.processes.len()),
+            ..Default::default()
+        };
+        for (index, process) in self.processes.iter().enumerate() {
+            if !self.process_matches_filters(process, &query) {
+                continue;
+            }
+            view.indices.push(index);
+            view.stats.add(process);
+        }
+        view
     }
 
     pub fn visible_process_stats(&self) -> VisibleProcessStats {
         let query = SearchQuery::parse(&self.search);
         let mut stats = VisibleProcessStats::default();
-        self.processes
-            .iter()
-            .filter(|process| self.process_matches_filters(process, &query))
-            .for_each(|process| {
-                stats.rows += 1;
-                stats.ram_bytes = stats.ram_bytes.saturating_add(process.ram_bytes);
-                if let Some(vram) = process.vram_bytes() {
-                    stats.vram_bytes = stats.vram_bytes.saturating_add(vram);
-                }
-                stats.gpu_processes += usize::from(process.is_gpu_active());
-                stats.local_web_processes += usize::from(!process.local_endpoints.is_empty());
-            });
+        for process in &self.processes {
+            if self.process_matches_filters(process, &query) {
+                stats.add(process);
+            }
+        }
         stats
     }
 
     pub fn selected_process(&self) -> Option<&ProcessInfo> {
+        let pid = self.selected_pid?;
+        let process = self.processes.iter().find(|process| process.pid == pid)?;
         let query = SearchQuery::parse(&self.search);
-        self.selected_pid.and_then(|pid| {
-            self.processes
-                .iter()
-                .find(|process| process.pid == pid)
-                .filter(|process| self.process_matches_filters(process, &query))
-        })
+        self.process_matches_filters(process, &query)
+            .then_some(process)
     }
 
     pub fn selected_process_summary(&self) -> Option<String> {
@@ -862,7 +880,7 @@ impl WatcherApp {
         self.loading = false;
         self.last_auto_refresh = Instant::now();
         match result {
-            Ok(snapshot) => {
+            Ok((snapshot, loaded_settings)) => {
                 let selected_identity = self.selected_pid.and_then(|pid| {
                     self.processes
                         .iter()
@@ -875,7 +893,9 @@ impl WatcherApp {
                     &mut processes,
                     self.last_updated.is_some(),
                 );
-                crate::services::scope_detector::assign_scopes(&mut processes, &self.settings);
+                if !classification_settings_equal(&loaded_settings, &self.settings) {
+                    crate::services::scope_detector::assign_scopes(&mut processes, &self.settings);
+                }
                 for process in &mut processes {
                     process.refresh_searchable_text();
                 }
@@ -1121,6 +1141,12 @@ fn lines_from_vec(values: &[String]) -> String {
     values.join("\n")
 }
 
+fn classification_settings_equal(left: &Settings, right: &Settings) -> bool {
+    left.protected_process_names == right.protected_process_names
+        && left.python_keywords == right.python_keywords
+        && left.codex_root_keywords == right.codex_root_keywords
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SearchField {
     Any,
@@ -1141,7 +1167,24 @@ enum SearchField {
 struct SearchTerm {
     field: SearchField,
     value: String,
+    integer: Option<u32>,
+    numeric_mb: Option<NumericMbQuery>,
     excluded: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NumericMbQuery {
+    operator: NumericMbOperator,
+    megabytes: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum NumericMbOperator {
+    GreaterOrEqual,
+    LessOrEqual,
+    Greater,
+    Less,
+    Equal,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1178,10 +1221,24 @@ impl SearchQuery {
                     },
                     None => (SearchField::Any, raw),
                 };
-                (!value.is_empty()).then(|| SearchTerm {
-                    field,
-                    value: value.to_lowercase(),
-                    excluded,
+                (!value.is_empty()).then(|| {
+                    let value = value.to_lowercase();
+                    let integer = matches!(
+                        field,
+                        SearchField::Pid | SearchField::Parent | SearchField::Port
+                    )
+                    .then(|| parse_canonical_u32(&value))
+                    .flatten();
+                    let numeric_mb = matches!(field, SearchField::Ram | SearchField::Vram)
+                        .then(|| NumericMbQuery::parse(&value))
+                        .flatten();
+                    SearchTerm {
+                        field,
+                        value,
+                        integer,
+                        numeric_mb,
+                        excluded,
+                    }
                 })
             })
             .collect();
@@ -1192,53 +1249,41 @@ impl SearchQuery {
         self.terms.iter().all(|term| {
             let matched = match term.field {
                 SearchField::Any => process.searchable_text_lower.contains(&term.value),
-                SearchField::Pid => process.pid.to_string() == term.value,
-                SearchField::Name => process.name.to_lowercase().contains(&term.value),
-                SearchField::Scope => process
-                    .scope
-                    .to_string()
-                    .to_lowercase()
-                    .contains(&term.value),
-                SearchField::Path => process
-                    .exe_path
-                    .as_deref()
-                    .unwrap_or_default()
-                    .to_lowercase()
-                    .contains(&term.value),
-                SearchField::Command => process
-                    .command_line
-                    .as_deref()
-                    .unwrap_or_default()
-                    .to_lowercase()
-                    .contains(&term.value),
+                SearchField::Pid => term.integer == Some(process.pid),
+                SearchField::Name => contains_lowercase(&process.name, &term.value),
+                SearchField::Scope => contains_lowercase(process.scope.as_str(), &term.value),
+                SearchField::Path => {
+                    contains_lowercase(process.exe_path.as_deref().unwrap_or_default(), &term.value)
+                }
+                SearchField::Command => contains_lowercase(
+                    process.command_line.as_deref().unwrap_or_default(),
+                    &term.value,
+                ),
                 SearchField::Parent => {
-                    process
-                        .parent_name
-                        .as_deref()
-                        .unwrap_or_default()
-                        .to_lowercase()
-                        .contains(&term.value)
-                        || process
-                            .parent_pid
-                            .is_some_and(|pid| pid.to_string() == term.value)
+                    contains_lowercase(
+                        process.parent_name.as_deref().unwrap_or_default(),
+                        &term.value,
+                    ) || process
+                        .parent_pid
+                        .is_some_and(|pid| term.integer == Some(pid))
                 }
                 SearchField::Port => process
                     .local_endpoints
                     .iter()
-                    .any(|endpoint| endpoint.port.to_string() == term.value),
+                    .any(|endpoint| term.integer == Some(u32::from(endpoint.port))),
                 SearchField::Web => process
                     .local_endpoints
                     .iter()
-                    .any(|endpoint| endpoint.url.to_lowercase().contains(&term.value)),
-                SearchField::State => process
-                    .snapshot_state
-                    .to_string()
-                    .to_lowercase()
-                    .contains(&term.value),
-                SearchField::Ram => numeric_mb_matches(process.ram_bytes, &term.value),
+                    .any(|endpoint| contains_lowercase(&endpoint.url, &term.value)),
+                SearchField::State => {
+                    contains_lowercase(process.snapshot_state.as_str(), &term.value)
+                }
+                SearchField::Ram => term
+                    .numeric_mb
+                    .is_some_and(|query| query.matches(process.ram_bytes)),
                 SearchField::Vram => process
                     .vram_bytes()
-                    .is_some_and(|bytes| numeric_mb_matches(bytes, &term.value)),
+                    .is_some_and(|bytes| term.numeric_mb.is_some_and(|query| query.matches(bytes))),
             };
             matched != term.excluded
         })
@@ -1266,35 +1311,60 @@ fn split_search_tokens(query: &str) -> Vec<String> {
     tokens
 }
 
-fn numeric_mb_matches(bytes: u64, expression: &str) -> bool {
-    let (operator, value) = if let Some(value) = expression.strip_prefix(">=") {
-        (">=", value)
-    } else if let Some(value) = expression.strip_prefix("<=") {
-        ("<=", value)
-    } else if let Some(value) = expression.strip_prefix('>') {
-        (">", value)
-    } else if let Some(value) = expression.strip_prefix('<') {
-        ("<", value)
-    } else if let Some(value) = expression.strip_prefix('=') {
-        ("=", value)
-    } else {
-        (">=", expression)
-    };
-    let Ok(megabytes) = value.parse::<f64>() else {
-        return false;
-    };
-    if !megabytes.is_finite() || megabytes < 0.0 {
-        return false;
+impl NumericMbQuery {
+    fn parse(expression: &str) -> Option<Self> {
+        let (operator, value) = if let Some(value) = expression.strip_prefix(">=") {
+            (NumericMbOperator::GreaterOrEqual, value)
+        } else if let Some(value) = expression.strip_prefix("<=") {
+            (NumericMbOperator::LessOrEqual, value)
+        } else if let Some(value) = expression.strip_prefix('>') {
+            (NumericMbOperator::Greater, value)
+        } else if let Some(value) = expression.strip_prefix('<') {
+            (NumericMbOperator::Less, value)
+        } else if let Some(value) = expression.strip_prefix('=') {
+            (NumericMbOperator::Equal, value)
+        } else {
+            (NumericMbOperator::GreaterOrEqual, expression)
+        };
+        let megabytes = value.parse::<f64>().ok()?;
+        if !megabytes.is_finite() || megabytes < 0.0 {
+            return None;
+        }
+        Some(Self {
+            operator,
+            megabytes,
+        })
     }
-    let actual = bytes as f64 / 1024.0 / 1024.0;
-    match operator {
-        ">=" => actual >= megabytes,
-        "<=" => actual <= megabytes,
-        ">" => actual > megabytes,
-        "<" => actual < megabytes,
-        "=" => (actual - megabytes).abs() < 0.05,
-        _ => false,
+
+    fn matches(self, bytes: u64) -> bool {
+        let actual = bytes as f64 / 1024.0 / 1024.0;
+        match self.operator {
+            NumericMbOperator::GreaterOrEqual => actual >= self.megabytes,
+            NumericMbOperator::LessOrEqual => actual <= self.megabytes,
+            NumericMbOperator::Greater => actual > self.megabytes,
+            NumericMbOperator::Less => actual < self.megabytes,
+            NumericMbOperator::Equal => (actual - self.megabytes).abs() < 0.05,
+        }
     }
+}
+
+fn parse_canonical_u32(value: &str) -> Option<u32> {
+    let parsed = value.parse::<u32>().ok()?;
+    (parsed.to_string() == value).then_some(parsed)
+}
+
+fn contains_lowercase(value: &str, lowercase_needle: &str) -> bool {
+    if lowercase_needle.is_empty() {
+        return true;
+    }
+    if value.is_ascii() && lowercase_needle.is_ascii() {
+        let needle = lowercase_needle.as_bytes();
+        return value
+            .as_bytes()
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle));
+    }
+    value.to_lowercase().contains(lowercase_needle)
 }
 
 fn sanitize_tsv_field(value: &str) -> String {
@@ -1677,6 +1747,45 @@ mod tests {
     }
 
     #[test]
+    fn completed_load_reclassifies_when_detection_settings_changed() {
+        let loaded_settings = Settings {
+            protected_process_names: Vec::new(),
+            python_keywords: vec!["special-worker".to_string()],
+            codex_root_keywords: Vec::new(),
+            ..Default::default()
+        };
+        let mut current_settings = loaded_settings.clone();
+        current_settings.python_keywords.clear();
+        let mut loaded_process = process(999_999, "worker.exe", 100, 64);
+        loaded_process.command_line = Some("special-worker".to_string());
+        crate::services::scope_detector::assign_scopes(
+            std::slice::from_mut(&mut loaded_process),
+            &loaded_settings,
+        );
+        assert!(loaded_process.python_related);
+        let snapshot = ProcessSnapshot {
+            processes: vec![loaded_process],
+            ..Default::default()
+        };
+        let (sender, receiver) = mpsc::channel();
+        sender.send(Ok((snapshot, loaded_settings))).unwrap();
+        let mut app = WatcherApp {
+            settings: current_settings,
+            loading: true,
+            load_receiver: Some(receiver),
+            ..Default::default()
+        };
+
+        app.poll_load();
+
+        assert!(!app.loading);
+        assert!(!app.processes[0].python_related);
+        assert!(app.processes[0]
+            .searchable_text_lower
+            .contains("worker.exe"));
+    }
+
+    #[test]
     fn structured_search_supports_fields_quotes_numeric_ranges_and_exclusions() {
         let mut process = process(42, "python.exe", 100, 2048);
         process.command_line = Some("python server.py --mode production".to_string());
@@ -1692,8 +1801,40 @@ mod tests {
         )
         .matches(&process));
         assert!(!SearchQuery::parse("pid:4").matches(&process));
+        assert!(!SearchQuery::parse("pid:042").matches(&process));
+        assert!(SearchQuery::parse("name:PYTHON ram:>=2048").matches(&process));
         assert!(!SearchQuery::parse("vram:>0").matches(&process));
         assert!(!SearchQuery::parse("-cmd:production").matches(&process));
+    }
+
+    #[test]
+    fn field_search_keeps_unicode_case_insensitive_matching() {
+        let mut process = process(7, "ÄTool.exe", 100, 64);
+        process.exe_path = Some(r"C:\ÄPP\ÄTool.exe".to_string());
+        process.refresh_searchable_text();
+
+        assert!(SearchQuery::parse("name:ätool path:äpp").matches(&process));
+    }
+
+    #[test]
+    fn visible_view_collects_rows_and_stats_in_one_result() {
+        let mut python = process(10, "python.exe", 100, 2048);
+        python.python_related = true;
+        python.local_endpoints = vec![ListeningEndpoint::new("127.0.0.1".to_string(), 7860, false)];
+        python.refresh_searchable_text();
+        let node = process(20, "node.exe", 100, 512);
+        let app = WatcherApp {
+            processes: vec![python, node],
+            search: "name:python".to_string(),
+            ..Default::default()
+        };
+
+        let visible = app.visible_process_view();
+
+        assert_eq!(visible.indices, vec![0]);
+        assert_eq!(visible.stats.rows, 1);
+        assert_eq!(visible.stats.ram_bytes, mb_to_bytes(2048));
+        assert_eq!(visible.stats.local_web_processes, 1);
     }
 
     #[test]

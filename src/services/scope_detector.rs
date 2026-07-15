@@ -4,20 +4,25 @@ use crate::settings::Settings;
 use std::collections::HashMap;
 
 pub fn assign_scopes(processes: &mut [ProcessInfo], settings: &Settings) {
+    let python_keywords = lowercase_keywords(&settings.python_keywords);
+    let codex_root_keywords = lowercase_keywords(&settings.codex_root_keywords);
+    let mut python_related = Vec::with_capacity(processes.len());
     let ancestry = processes
         .iter()
         .map(|process| {
+            let text = text_of(process);
+            python_related.push(is_python_related(process, &text, &python_keywords));
             (
                 process.pid,
                 AncestryNode {
                     parent_pid: process.parent_pid,
-                    root_candidate: is_root_candidate(process, settings),
+                    root_candidate: is_root_candidate(&text, &codex_root_keywords),
                 },
             )
         })
         .collect::<HashMap<_, _>>();
     let current_pid = std::process::id();
-    for p in processes {
+    for (p, python_related) in processes.iter_mut().zip(python_related) {
         p.protection_reason = None;
         if p.pid == current_pid {
             p.protected = true;
@@ -31,7 +36,7 @@ pub fn assign_scopes(processes: &mut [ProcessInfo], settings: &Settings) {
         } else {
             p.protected = false;
         }
-        p.python_related = is_python_related(p, settings);
+        p.python_related = python_related;
         p.codex_related = is_codex_related(p.pid, &ancestry);
         let gpu_active = p.is_gpu_active();
         p.scope = if p.protected {
@@ -57,35 +62,47 @@ struct AncestryNode {
 }
 
 fn text_of(p: &ProcessInfo) -> String {
-    format!(
-        "{} {} {}",
-        p.name,
-        p.exe_path.as_deref().unwrap_or_default(),
-        p.command_line.as_deref().unwrap_or_default()
-    )
-    .to_lowercase()
+    let exe_path = p.exe_path.as_deref().unwrap_or_default();
+    let command_line = p.command_line.as_deref().unwrap_or_default();
+    let mut text = String::with_capacity(p.name.len() + exe_path.len() + command_line.len() + 2);
+    text.push_str(&p.name);
+    text.push(' ');
+    text.push_str(exe_path);
+    text.push(' ');
+    text.push_str(command_line);
+    if text.is_ascii() {
+        text.make_ascii_lowercase();
+        text
+    } else {
+        text.to_lowercase()
+    }
 }
 
-fn is_python_related(p: &ProcessInfo, settings: &Settings) -> bool {
-    let text = text_of(p);
-    let process_name = p.name.to_lowercase();
-    let exe_path = p.exe_path.as_deref().unwrap_or_default().to_lowercase();
-    let python_executable = matches!(
-        process_name.as_str(),
-        "python.exe" | "pythonw.exe" | "py.exe" | "python" | "pythonw" | "py"
-    ) || exe_path.ends_with("\\python.exe")
-        || exe_path.ends_with("\\pythonw.exe")
-        || exe_path.ends_with("\\py.exe");
+fn is_python_related(p: &ProcessInfo, text: &str, python_keywords: &[String]) -> bool {
+    let python_executable = [
+        "python.exe",
+        "pythonw.exe",
+        "py.exe",
+        "python",
+        "pythonw",
+        "py",
+    ]
+    .iter()
+    .any(|name| p.name.eq_ignore_ascii_case(name))
+        || [r"\python.exe", r"\pythonw.exe", r"\py.exe"]
+            .iter()
+            .any(|suffix| {
+                ends_with_ignore_ascii_case(p.exe_path.as_deref().unwrap_or_default(), suffix)
+            });
 
-    for keyword in &settings.python_keywords {
-        let keyword = keyword.to_lowercase();
+    for keyword in python_keywords {
         if keyword == ".py" {
             if python_executable && text.contains(".py") {
                 return true;
             }
             continue;
         }
-        if text.contains(&keyword) {
+        if text.contains(keyword) {
             return true;
         }
     }
@@ -93,12 +110,23 @@ fn is_python_related(p: &ProcessInfo, settings: &Settings) -> bool {
     python_executable
 }
 
-fn is_root_candidate(p: &ProcessInfo, settings: &Settings) -> bool {
-    let text = text_of(p);
-    settings
-        .codex_root_keywords
+fn is_root_candidate(text: &str, codex_root_keywords: &[String]) -> bool {
+    codex_root_keywords
         .iter()
-        .any(|kw| text.contains(&kw.to_lowercase()))
+        .any(|keyword| text.contains(keyword))
+}
+
+fn lowercase_keywords(keywords: &[String]) -> Vec<String> {
+    keywords
+        .iter()
+        .map(|keyword| keyword.to_lowercase())
+        .collect()
+}
+
+fn ends_with_ignore_ascii_case(value: &str, suffix: &str) -> bool {
+    value
+        .get(value.len().saturating_sub(suffix.len())..)
+        .is_some_and(|ending| ending.eq_ignore_ascii_case(suffix))
 }
 
 fn is_codex_related(pid: u32, ancestry: &HashMap<u32, AncestryNode>) -> bool {
@@ -166,5 +194,33 @@ mod tests {
             processes[0].protection_reason.as_deref(),
             Some("Built-in critical process")
         );
+    }
+
+    #[test]
+    fn keyword_detection_remains_case_insensitive() {
+        let settings = Settings {
+            python_keywords: vec!["UVICORN".to_string()],
+            codex_root_keywords: vec!["TERMINAL.EXE".to_string()],
+            ..Default::default()
+        };
+        let mut processes = vec![
+            ProcessInfo {
+                pid: 10,
+                name: "Terminal.exe".to_string(),
+                ..Default::default()
+            },
+            ProcessInfo {
+                pid: 20,
+                parent_pid: Some(10),
+                name: "worker.exe".to_string(),
+                command_line: Some("uvicorn app:api".to_string()),
+                ..Default::default()
+            },
+        ];
+
+        assign_scopes(&mut processes, &settings);
+
+        assert!(processes[1].python_related);
+        assert!(processes[1].codex_related);
     }
 }

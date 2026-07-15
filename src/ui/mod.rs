@@ -1,4 +1,4 @@
-use crate::app::{PendingAction, QuickFilter, WatcherApp};
+use crate::app::{PendingAction, QuickFilter, VisibleProcessStats, WatcherApp};
 use crate::model::SortPreset;
 use crate::services::formatter;
 use crate::settings::TableView;
@@ -14,25 +14,36 @@ const MIN_PROCESS_TABLE_HEIGHT: f32 = 160.0;
 const SPLITTER_HEIGHT: f32 = 8.0;
 
 pub fn draw(ctx: &egui::Context, app: &mut WatcherApp) {
-    egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+    let visible = egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
         ui.add_space(4.0);
         draw_toolbar_row(ui, ctx, app);
         ui.add_space(3.0);
         draw_filter_row(ui, app);
         ui.add_space(3.0);
-        draw_sort_row(ui, app);
+        let sort_before = app.sort;
+        let mut visible = app.visible_process_view();
+        draw_sort_row(ui, app, visible.stats);
+        if app.sort != sort_before {
+            visible = app.visible_process_view();
+        }
         ui.add_space(4.0);
+        visible
     });
 
     egui::CentralPanel::default().show(ctx, |ui| {
-        draw_process_split(ui, ctx, app);
+        draw_process_split(ui, ctx, app, &visible.inner.indices);
     });
 
     draw_pending_dialog(ctx, app);
     settings_panel::draw(ctx, app);
 }
 
-fn draw_process_split(ui: &mut egui::Ui, ctx: &egui::Context, app: &mut WatcherApp) {
+fn draw_process_split(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    app: &mut WatcherApp,
+    rows: &[usize],
+) {
     let available_width = ui.available_width();
     let available_height = ui.available_height();
     if available_width <= 0.0 || available_height <= 0.0 {
@@ -53,7 +64,7 @@ fn draw_process_split(ui: &mut egui::Ui, ctx: &egui::Context, app: &mut WatcherA
     );
     let mut table_ui = ui.child_ui(table_rect, egui::Layout::top_down(egui::Align::LEFT), None);
     table_ui.set_clip_rect(table_rect);
-    process_table::draw(&mut table_ui, app, table_rect.height());
+    process_table::draw(&mut table_ui, app, table_rect.height(), rows);
 
     let (splitter_rect, resize_response) = ui.allocate_exact_size(
         egui::vec2(available_width, SPLITTER_HEIGHT),
@@ -83,7 +94,7 @@ fn draw_process_split(ui: &mut egui::Ui, ctx: &egui::Context, app: &mut WatcherA
     detail_ui.add_space(4.0);
     draw_status_bar(&mut detail_ui, app);
     detail_ui.separator();
-    detail_panel::draw(&mut detail_ui, ctx, app);
+    detail_panel::draw(&mut detail_ui, ctx, app, rows);
 }
 
 fn clamped_detail_panel_height(requested: f32, full_height: f32) -> f32 {
@@ -256,7 +267,7 @@ fn draw_filter_row(ui: &mut egui::Ui, app: &mut WatcherApp) {
     });
 }
 
-fn draw_sort_row(ui: &mut egui::Ui, app: &mut WatcherApp) {
+fn draw_sort_row(ui: &mut egui::Ui, app: &mut WatcherApp, stats: VisibleProcessStats) {
     ui.horizontal_wrapped(|ui| {
         ui.label("Sort");
         let mut sort = app.sort;
@@ -287,7 +298,6 @@ fn draw_sort_row(ui: &mut egui::Ui, app: &mut WatcherApp) {
         }
 
         ui.separator();
-        let stats = app.visible_process_stats();
         ui.label(format!("Rows: {} / {}", stats.rows, app.processes.len()));
         ui.separator();
         ui.label(format!(

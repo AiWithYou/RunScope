@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::time::SystemTime;
 
 #[derive(Debug, Clone, Default)]
@@ -40,41 +41,58 @@ impl ProcessInfo {
     }
 
     fn build_searchable_text_lower(&self) -> String {
-        format!(
+        let local_web = self.local_web_summary();
+        let mut text = String::with_capacity(
+            self.name.len()
+                + self.parent_name.as_deref().unwrap_or_default().len()
+                + self.exe_path.as_deref().unwrap_or_default().len()
+                + self.command_line.as_deref().unwrap_or_default().len()
+                + self.protection_reason.as_deref().unwrap_or_default().len()
+                + local_web.len()
+                + 64,
+        );
+        let _ = write!(
+            &mut text,
             "{} {} {} {} {} {} {} {} {}",
-            self.scope,
+            self.scope.as_str(),
             self.pid,
             self.name,
             self.parent_name.as_deref().unwrap_or_default(),
             self.exe_path.as_deref().unwrap_or_default(),
             self.command_line.as_deref().unwrap_or_default(),
             self.protection_reason.as_deref().unwrap_or_default(),
-            self.local_web_summary(),
-            self.snapshot_state
-        )
-        .to_lowercase()
+            local_web,
+            self.snapshot_state.as_str(),
+        );
+        if text.is_ascii() {
+            text.make_ascii_lowercase();
+            text
+        } else {
+            text.to_lowercase()
+        }
     }
 
     pub fn local_web_summary(&self) -> String {
         let mut urls = self
             .local_endpoints
             .iter()
-            .map(|endpoint| endpoint.url.clone())
+            .map(|endpoint| endpoint.url.as_str())
             .collect::<Vec<_>>();
-        urls.sort();
+        urls.sort_unstable();
         urls.dedup();
         urls.join(", ")
     }
 
     pub fn local_web_port_count(&self) -> usize {
-        let mut ports = self
-            .local_endpoints
+        self.local_endpoints
             .iter()
-            .map(|endpoint| endpoint.port)
-            .collect::<Vec<_>>();
-        ports.sort_unstable();
-        ports.dedup();
-        ports.len()
+            .enumerate()
+            .filter(|(index, endpoint)| {
+                !self.local_endpoints[..*index]
+                    .iter()
+                    .any(|previous| previous.port == endpoint.port)
+            })
+            .count()
     }
 
     pub fn primary_local_web_url(&self) -> Option<&str> {
@@ -116,13 +134,18 @@ pub enum SnapshotState {
 
 impl std::fmt::Display for SnapshotState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let text = match self {
+        f.write_str(self.as_str())
+    }
+}
+
+impl SnapshotState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
             Self::Unavailable => "No baseline",
             Self::New => "New",
             Self::Changed => "Changed",
             Self::Unchanged => "Unchanged",
-        };
-        f.write_str(text)
+        }
     }
 }
 
@@ -185,15 +208,20 @@ pub enum ProcessScope {
 
 impl std::fmt::Display for ProcessScope {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let text = match self {
+        f.write_str(self.as_str())
+    }
+}
+
+impl ProcessScope {
+    pub const fn as_str(self) -> &'static str {
+        match self {
             Self::CodexTerminal => "Codex/Terminal",
             Self::CodexGpu => "Codex+GPU",
             Self::Python => "Python",
             Self::GpuActive => "GPU",
             Self::Protected => "Protected",
             Self::Normal => "Normal",
-        };
-        f.write_str(text)
+        }
     }
 }
 
@@ -336,5 +364,20 @@ mod tests {
         let process = ProcessInfo::default();
 
         assert_eq!(process.local_web_table_text(), "-");
+    }
+
+    #[test]
+    fn local_web_table_counts_unique_ports_without_duplicate_addresses() {
+        let process = ProcessInfo {
+            local_endpoints: vec![
+                ListeningEndpoint::new("127.0.0.1".to_string(), 7860, false),
+                ListeningEndpoint::new("::1".to_string(), 7860, true),
+                ListeningEndpoint::new("127.0.0.1".to_string(), 9000, false),
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(process.local_web_port_count(), 2);
+        assert_eq!(process.local_web_table_text(), "http://127.0.0.1:7860 (+1)");
     }
 }
