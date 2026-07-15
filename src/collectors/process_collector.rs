@@ -335,6 +335,7 @@ mod tests {
                 panic!("current PID {current_pid} was not present in the process snapshot")
             });
         assert!(current.protected);
+        assert!(current.start_time.is_some());
         assert_eq!(
             current.protection_reason.as_deref(),
             Some("Current RunScope process")

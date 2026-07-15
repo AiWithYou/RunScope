@@ -918,7 +918,7 @@ impl WatcherApp {
                 if let Some(expected) = selected_identity {
                     if !self.processes.iter().any(|process| {
                         process.pid == expected.pid
-                            && process_identity::same_process(&expected, process)
+                            && process_identity::same_process_for_snapshot(&expected, process)
                     }) {
                         self.selected_pid = None;
                     }
@@ -1433,7 +1433,7 @@ fn apply_snapshot_deltas(
         let Some(previous) = previous_by_pid
             .get(&process.pid)
             .copied()
-            .filter(|previous| process_identity::same_process(previous, process))
+            .filter(|previous| process_identity::same_process_for_snapshot(previous, process))
         else {
             process.snapshot_state = SnapshotState::New;
             summary.started += 1;
@@ -1888,6 +1888,25 @@ mod tests {
         assert_eq!(summary.changed, 0);
         assert_eq!(current[0].ram_delta_bytes, None);
         assert_eq!(current[0].snapshot_state, SnapshotState::New);
+    }
+
+    #[test]
+    fn snapshot_delta_does_not_report_uninspectable_stable_pids_as_restarted() {
+        let mut previous = process(10, "System", 100, 100);
+        previous.start_time = None;
+        previous.exe_path = None;
+        let mut current = vec![ProcessInfo {
+            ram_bytes: mb_to_bytes(140),
+            ..previous.clone()
+        }];
+
+        let summary = apply_snapshot_deltas(&[previous], &mut current, true).unwrap();
+
+        assert_eq!(summary.started, 0);
+        assert_eq!(summary.exited, 0);
+        assert_eq!(summary.changed, 1);
+        assert_eq!(current[0].ram_delta_bytes, Some(mb_to_bytes(40) as i64));
+        assert_eq!(current[0].snapshot_state, SnapshotState::Changed);
     }
 
     #[test]

@@ -39,6 +39,28 @@ pub fn same_process(left: &ProcessInfo, right: &ProcessInfo) -> bool {
         )
 }
 
+/// Compares process identity for non-destructive snapshot presentation only.
+///
+/// Windows can withhold both the executable path and creation time for
+/// protected processes. Treating every such PID as a new process makes two
+/// consecutive snapshots report large, false start/exit counts. This relaxed
+/// comparison is deliberately separate from [`same_process`], which remains
+/// fail-closed for Close/Kill/Kill Tree validation.
+pub fn same_process_for_snapshot(left: &ProcessInfo, right: &ProcessInfo) -> bool {
+    if left.pid != right.pid || !left.name.eq_ignore_ascii_case(&right.name) {
+        return false;
+    }
+
+    match (left.start_time, right.start_time) {
+        (Some(left_start), Some(right_start)) => {
+            left_start == right_start
+                && paths_do_not_conflict(left.exe_path.as_deref(), right.exe_path.as_deref())
+        }
+        (None, None) => paths_do_not_conflict(left.exe_path.as_deref(), right.exe_path.as_deref()),
+        _ => false,
+    }
+}
+
 pub fn target_list_changed(previous: &[ProcessInfo], current: &[ProcessInfo]) -> bool {
     let mut previous = previous.iter().map(identity_key).collect::<Vec<_>>();
     let mut current = current.iter().map(identity_key).collect::<Vec<_>>();
@@ -91,8 +113,12 @@ fn identity_matches(
         return false;
     }
 
-    match (expected_exe_path, current_exe_path) {
-        (Some(expected), Some(current)) => expected.eq_ignore_ascii_case(current),
+    paths_do_not_conflict(expected_exe_path, current_exe_path)
+}
+
+fn paths_do_not_conflict(left: Option<&str>, right: Option<&str>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
         _ => true,
     }
 }
@@ -155,6 +181,42 @@ mod tests {
         right.start_time = None;
 
         assert!(!same_process(&left, &right));
+    }
+
+    #[test]
+    fn snapshot_identity_keeps_uninspectable_processes_continuous() {
+        let mut left = process(10, "System", None, 100);
+        let mut right = left.clone();
+        left.start_time = None;
+        right.start_time = None;
+
+        assert!(same_process_for_snapshot(&left, &right));
+        right.name = "Registry".to_string();
+        assert!(!same_process_for_snapshot(&left, &right));
+
+        right = left.clone();
+        right.start_time = Some(UNIX_EPOCH + Duration::from_secs(100));
+        assert!(!same_process_for_snapshot(&left, &right));
+    }
+
+    #[test]
+    fn snapshot_identity_never_ignores_conflicting_known_metadata() {
+        let left = process(10, "python.exe", Some(r"C:\Python\python.exe"), 100);
+        let mut right = process(10, "python.exe", Some(r"C:\Other\python.exe"), 100);
+
+        assert!(!same_process_for_snapshot(&left, &right));
+        let mut left_without_start = left.clone();
+        let mut right_without_start = right.clone();
+        left_without_start.start_time = None;
+        right_without_start.start_time = None;
+        assert!(!same_process_for_snapshot(
+            &left_without_start,
+            &right_without_start
+        ));
+
+        right.exe_path = left.exe_path.clone();
+        right.start_time = Some(UNIX_EPOCH + Duration::from_secs(101));
+        assert!(!same_process_for_snapshot(&left, &right));
     }
 
     #[test]
