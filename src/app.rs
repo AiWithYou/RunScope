@@ -351,10 +351,10 @@ impl WatcherApp {
             let process = &self.processes[index];
             lines.push(
                 [
-                    process.snapshot_state.to_string(),
-                    process.scope.to_string(),
+                    sanitize_tsv_field(&process.snapshot_state.to_string()),
+                    sanitize_tsv_field(&process.scope.to_string()),
                     process.pid.to_string(),
-                    process.name.clone(),
+                    sanitize_tsv_text_field(&process.name),
                     crate::services::formatter::bytes_to_mb_text(process.ram_bytes),
                     crate::services::formatter::optional_delta_mb_text(process.ram_delta_bytes),
                     crate::services::formatter::optional_bytes_to_mb_text(process.vram_bytes()),
@@ -364,14 +364,11 @@ impl WatcherApp {
                         .parent_pid
                         .map(|pid| pid.to_string())
                         .unwrap_or_default(),
-                    process.parent_name.clone().unwrap_or_default(),
-                    process.local_web_summary(),
-                    process.exe_path.clone().unwrap_or_default(),
-                    process.command_line.clone().unwrap_or_default(),
+                    sanitize_tsv_text_field(process.parent_name.as_deref().unwrap_or_default()),
+                    sanitize_tsv_field(&process.local_web_summary()),
+                    sanitize_tsv_text_field(process.exe_path.as_deref().unwrap_or_default()),
+                    sanitize_tsv_text_field(process.command_line.as_deref().unwrap_or_default()),
                 ]
-                .into_iter()
-                .map(|value| sanitize_tsv_field(&value))
-                .collect::<Vec<_>>()
                 .join("\t"),
             );
         }
@@ -602,14 +599,9 @@ impl WatcherApp {
     }
 
     pub fn request_kill_selected(&mut self) {
-        let Some(process) = self.selected_process().cloned() else {
-            self.status = "No process selected.".to_string();
+        let Some(process) = self.selected_process_for_action("Kill") else {
             return;
         };
-        if process.protected {
-            self.status = format!("PID {} is protected.", process.pid);
-            return;
-        }
         self.pending_action = Some(PendingAction::Kill {
             targets: vec![process],
         });
@@ -656,17 +648,52 @@ impl WatcherApp {
     }
 
     pub fn request_close_selected(&mut self) {
-        let Some(process) = self.selected_process().cloned() else {
-            self.status = "No process selected.".to_string();
+        let Some(process) = self.selected_process_for_action("Close") else {
             return;
         };
-        if process.protected {
-            self.status = format!("PID {} is protected.", process.pid);
-            return;
-        }
         self.pending_action = Some(PendingAction::Close {
             targets: vec![process],
         });
+    }
+
+    fn selected_process_for_action(&mut self, label: &str) -> Option<ProcessInfo> {
+        let Some(expected) = self.selected_process().cloned() else {
+            self.status = "No process selected.".to_string();
+            return None;
+        };
+        if expected.protected {
+            self.status = format!("PID {} is protected.", expected.pid);
+            return None;
+        }
+
+        let mut current_processes =
+            match process_collector::collect_processes_for_action(&self.settings) {
+                Ok(processes) => processes,
+                Err(error) => {
+                    self.status = format!("{label} pre-check failed: {error}");
+                    return None;
+                }
+            };
+        enrich_action_processes(&mut current_processes, &self.processes);
+        let Some(current) = current_processes
+            .into_iter()
+            .find(|candidate| candidate.pid == expected.pid)
+        else {
+            self.status = format!(
+                "PID {} no longer exists. Reload and try again.",
+                expected.pid
+            );
+            return None;
+        };
+        if let Err(error) = process_identity::ensure_same_process(&expected, &current) {
+            self.status = error.to_string();
+            return None;
+        }
+        if current.protected {
+            self.status = format!("PID {} is protected.", current.pid);
+            return None;
+        }
+        Some(current)
     }
 
     pub fn confirm_pending_action(&mut self, ctx: &egui::Context) {
@@ -680,7 +707,7 @@ impl WatcherApp {
                     self.status = "No process selected.".to_string();
                     return;
                 };
-                let current_processes =
+                let mut current_processes =
                     match process_collector::collect_processes_for_action(&self.settings) {
                         Ok(processes) => processes,
                         Err(error) => {
@@ -688,6 +715,7 @@ impl WatcherApp {
                             return;
                         }
                     };
+                enrich_action_processes(&mut current_processes, &self.processes);
                 let Some(current) = current_processes
                     .iter()
                     .find(|candidate| candidate.pid == process.pid)
@@ -700,6 +728,15 @@ impl WatcherApp {
                 };
                 if let Err(error) = process_identity::ensure_same_process(process, current) {
                     self.status = error.to_string();
+                    return;
+                }
+                if action_targets_changed(&targets, std::slice::from_ref(current)) {
+                    self.pending_action = Some(PendingAction::Close {
+                        targets: vec![current.clone()],
+                    });
+                    self.status =
+                        "Process details changed. Review updated Local Web information before confirming."
+                            .to_string();
                     return;
                 }
                 match crate::services::terminator::close_process(current) {
@@ -720,7 +757,7 @@ impl WatcherApp {
                     self.status = "No process selected.".to_string();
                     return;
                 };
-                let current_processes =
+                let mut current_processes =
                     match process_collector::collect_processes_for_action(&self.settings) {
                         Ok(processes) => processes,
                         Err(error) => {
@@ -728,6 +765,7 @@ impl WatcherApp {
                             return;
                         }
                     };
+                enrich_action_processes(&mut current_processes, &self.processes);
                 let Some(current) = current_processes
                     .iter()
                     .find(|candidate| candidate.pid == process.pid)
@@ -740,6 +778,15 @@ impl WatcherApp {
                 };
                 if let Err(error) = process_identity::ensure_same_process(process, current) {
                     self.status = error.to_string();
+                    return;
+                }
+                if action_targets_changed(&targets, std::slice::from_ref(current)) {
+                    self.pending_action = Some(PendingAction::Kill {
+                        targets: vec![current.clone()],
+                    });
+                    self.status =
+                        "Process details changed. Review updated Local Web information before confirming."
+                            .to_string();
                     return;
                 }
                 match crate::services::terminator::kill_process(current) {
@@ -787,13 +834,12 @@ impl WatcherApp {
                     );
                     return;
                 }
-                if process_identity::target_list_changed(&targets, &current_targets) {
+                if action_targets_changed(&targets, &current_targets) {
                     self.pending_action = Some(PendingAction::KillTree {
                         targets: current_targets,
                     });
-                    self.status =
-                        "Process tree changed. Review updated target list before confirming."
-                            .to_string();
+                    self.status = "Process tree or Local Web details changed. Review the updated confirmation before continuing."
+                        .to_string();
                     return;
                 }
 
@@ -1419,6 +1465,15 @@ fn sanitize_tsv_field(value: &str) -> String {
     value.replace(['\t', '\r', '\n'], " ")
 }
 
+fn sanitize_tsv_text_field(value: &str) -> String {
+    let sanitized = sanitize_tsv_field(value);
+    if sanitized.trim_start().starts_with(['=', '+', '-', '@']) {
+        format!("'{sanitized}")
+    } else {
+        sanitized
+    }
+}
+
 fn empty_as_unavailable(value: &str) -> &str {
     if value.is_empty() {
         "not loaded"
@@ -1524,12 +1579,44 @@ fn enrich_action_processes(current: &mut [ProcessInfo], loaded: &[ProcessInfo]) 
             continue;
         };
         process.gpu = loaded.gpu.clone();
-        process.local_endpoints = loaded.local_endpoints.clone();
         process.ram_delta_bytes = loaded.ram_delta_bytes;
         process.vram_delta_bytes = loaded.vram_delta_bytes;
         process.snapshot_state = loaded.snapshot_state;
         process.refresh_searchable_text();
     }
+}
+
+fn action_targets_changed(previous: &[ProcessInfo], current: &[ProcessInfo]) -> bool {
+    if process_identity::target_list_changed(previous, current) {
+        return true;
+    }
+
+    let previous_by_pid = previous
+        .iter()
+        .map(|process| (process.pid, process))
+        .collect::<HashMap<_, _>>();
+    current.iter().any(|process| {
+        previous_by_pid
+            .get(&process.pid)
+            .is_none_or(|previous| listener_keys(previous) != listener_keys(process))
+    })
+}
+
+fn listener_keys(process: &ProcessInfo) -> Vec<(&str, u16, &str)> {
+    let mut keys = process
+        .local_endpoints
+        .iter()
+        .map(|endpoint| {
+            (
+                endpoint.bind_address.as_str(),
+                endpoint.port,
+                endpoint.url.as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
+    keys.sort_unstable();
+    keys.dedup();
+    keys
 }
 
 fn signed_byte_delta(current: u64, previous: u64) -> i64 {
@@ -1773,25 +1860,81 @@ mod tests {
         assert_eq!(app.status, "No process selected.");
     }
 
+    #[cfg(windows)]
     #[test]
     fn close_requires_confirmation() {
+        use std::os::windows::process::CommandExt;
+        use std::process::Stdio;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let mut child = Command::new("cmd.exe")
+            .args(["/D", "/C", "ping.exe -n 30 127.0.0.1 >NUL"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .expect("spawn harmless process for confirmation test");
+        let child_pid = child.id();
+        let settings = Settings::default();
+        let processes = process_collector::collect_processes_for_action(&settings)
+            .expect("collect spawned process");
         let mut app = WatcherApp {
-            processes: vec![ProcessInfo {
-                pid: 42,
-                name: "notepad.exe".to_string(),
-                start_time: Some(SystemTime::now()),
-                ..Default::default()
-            }],
-            selected_pid: Some(42),
+            settings,
+            processes,
+            selected_pid: Some(child_pid),
             ..Default::default()
         };
 
         app.request_close_selected();
 
-        assert!(matches!(
+        let requires_confirmation = matches!(
             app.pending_action,
-            Some(PendingAction::Close { ref targets }) if targets.len() == 1 && targets[0].pid == 42
-        ));
+            Some(PendingAction::Close { ref targets })
+                if targets.len() == 1 && targets[0].pid == child_pid
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(requires_confirmation, "{}", app.status);
+    }
+
+    #[test]
+    fn action_enrichment_preserves_fresh_listener_data() {
+        let loaded = ProcessInfo {
+            local_endpoints: vec![ListeningEndpoint::new("127.0.0.1".to_string(), 8000, false)],
+            ..process(42, "server.exe", 100, 64)
+        };
+        let mut current = vec![ProcessInfo {
+            local_endpoints: vec![ListeningEndpoint::new("127.0.0.1".to_string(), 9000, false)],
+            ..loaded.clone()
+        }];
+
+        enrich_action_processes(&mut current, &[loaded]);
+
+        assert_eq!(current[0].local_endpoints.len(), 1);
+        assert_eq!(current[0].local_endpoints[0].port, 9000);
+    }
+
+    #[test]
+    fn action_confirmation_detects_listener_changes() {
+        let previous = ProcessInfo {
+            local_endpoints: vec![ListeningEndpoint::new("127.0.0.1".to_string(), 8000, false)],
+            ..process(42, "server.exe", 100, 64)
+        };
+        let current = ProcessInfo {
+            local_endpoints: vec![ListeningEndpoint::new("127.0.0.1".to_string(), 9000, false)],
+            ..previous.clone()
+        };
+
+        assert!(action_targets_changed(&[previous], &[current]));
+    }
+
+    #[test]
+    fn tsv_text_fields_cannot_become_spreadsheet_formulas() {
+        assert_eq!(sanitize_tsv_text_field("=1+1"), "'=1+1");
+        assert_eq!(sanitize_tsv_text_field("  @SUM(A1)"), "'  @SUM(A1)");
+        assert_eq!(sanitize_tsv_text_field("safe\tvalue"), "safe value");
+        assert_eq!(sanitize_tsv_field("-12.5"), "-12.5");
     }
 
     #[test]

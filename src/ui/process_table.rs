@@ -515,9 +515,9 @@ fn scope_badge_style(
         ),
     };
     let stroke = if selected {
-        egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 120, 150))
+        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(80, 120, 150))
     } else {
-        egui::Stroke::new(1.0, fill)
+        egui::Stroke::new(1.0_f32, fill)
     };
     (fill, stroke, text)
 }

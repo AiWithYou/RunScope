@@ -1,12 +1,14 @@
 use crate::collectors::{gpu_nvidia_smi, gpu_nvml, gpu_windows_perf, local_listeners};
 use crate::model::{GpuProcessInfo, ProcessInfo, ProcessSnapshot, SnapshotState};
-use crate::services::scope_detector;
+use crate::services::{process_identity, scope_detector};
 use crate::settings::Settings;
-use anyhow::bail;
+use anyhow::{bail, Context};
 use std::collections::HashMap;
 use std::sync::{mpsc, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant, UNIX_EPOCH};
+#[cfg(any(not(windows), test))]
+use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant};
 use sysinfo::{ProcessRefreshKind, System, UpdateKind};
 
 pub fn collect_processes(settings: &Settings) -> anyhow::Result<ProcessSnapshot> {
@@ -70,10 +72,12 @@ fn duration_text(duration: Duration) -> String {
 }
 
 pub fn collect_processes_for_action(settings: &Settings) -> anyhow::Result<Vec<ProcessInfo>> {
+    let listeners_by_pid = local_listeners::collect_local_listeners()
+        .context("failed to collect local listeners for action confirmation")?;
     Ok(collect_process_infos(
         settings,
         HashMap::new(),
-        HashMap::new(),
+        listeners_by_pid,
     ))
 }
 
@@ -100,6 +104,9 @@ fn collect_process_infos(
         let command_line = non_empty(process.cmd().join(" "));
         let exe_path = process.exe().map(|path| path.to_string_lossy().to_string());
         let cwd = process.cwd().map(|path| path.to_string_lossy().to_string());
+        #[cfg(windows)]
+        let start_time = process_identity::process_start_time(pid_u32).ok();
+        #[cfg(not(windows))]
         let start_time = if process.start_time() > 0 {
             Some(UNIX_EPOCH + Duration::from_secs(process.start_time()))
         } else {
@@ -339,6 +346,29 @@ mod tests {
         assert_eq!(
             current.protection_reason.as_deref(),
             Some("Current RunScope process")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn action_snapshot_includes_fresh_local_listener() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("bind local listener");
+        let port = listener.local_addr().expect("listener address").port();
+
+        let processes =
+            collect_processes_for_action(&Settings::default()).expect("collect action snapshot");
+        let current = processes
+            .iter()
+            .find(|process| process.pid == std::process::id())
+            .expect("current process is present");
+
+        assert!(
+            current
+                .local_endpoints
+                .iter()
+                .any(|endpoint| endpoint.port == port),
+            "fresh listener on port {port} was missing from action snapshot"
         );
     }
 

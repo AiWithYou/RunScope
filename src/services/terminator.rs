@@ -37,8 +37,7 @@ pub fn kill_tree(targets_root_first: &[ProcessInfo]) -> anyhow::Result<Vec<u32>>
 
 pub fn close_process(process: &ProcessInfo) -> anyhow::Result<usize> {
     ensure_not_protected(process)?;
-    process_identity::ensure_current_process_matches(process)?;
-    close_pid(process.pid)
+    close_pid(process)
 }
 
 fn ensure_not_protected(process: &ProcessInfo) -> anyhow::Result<()> {
@@ -57,10 +56,9 @@ fn ensure_not_protected(process: &ProcessInfo) -> anyhow::Result<()> {
 
 #[cfg(windows)]
 fn kill_pid(process: &ProcessInfo) -> anyhow::Result<()> {
-    use windows::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Threading::{
-        GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
-        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+        OpenProcess, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
     };
 
     let pid = process.pid;
@@ -73,26 +71,7 @@ fn kill_pid(process: &ProcessInfo) -> anyhow::Result<()> {
         )
         .with_context(|| format!("failed to open PID {pid} for termination"))?;
         let result = (|| {
-            let mut creation = FILETIME::default();
-            let mut exit = FILETIME::default();
-            let mut kernel = FILETIME::default();
-            let mut user = FILETIME::default();
-            GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user)
-                .with_context(|| format!("failed to read PID {pid} creation time"))?;
-            validate_creation_time(process, creation)?;
-
-            let mut path_buffer = vec![0_u16; 32_768];
-            let mut path_length = path_buffer.len() as u32;
-            QueryFullProcessImageNameW(
-                handle,
-                Default::default(),
-                windows::core::PWSTR(path_buffer.as_mut_ptr()),
-                &mut path_length,
-            )
-            .with_context(|| format!("failed to read PID {pid} executable path"))?;
-            let current_path = String::from_utf16_lossy(&path_buffer[..path_length as usize]);
-            validate_executable_path(process, &current_path)?;
-
+            validate_process_handle(process, handle)?;
             TerminateProcess(handle, 1).with_context(|| format!("failed to terminate PID {pid}"))
         })();
         let _ = CloseHandle(handle);
@@ -106,28 +85,51 @@ fn kill_pid(_process: &ProcessInfo) -> anyhow::Result<()> {
 }
 
 #[cfg(windows)]
-fn validate_creation_time(
+fn validate_process_handle(
     process: &ProcessInfo,
-    creation: windows::Win32::Foundation::FILETIME,
+    handle: windows::Win32::Foundation::HANDLE,
 ) -> anyhow::Result<()> {
-    use std::time::UNIX_EPOCH;
+    use windows::Win32::Foundation::BOOL;
+    use windows::Win32::System::Threading::{IsProcessCritical, QueryFullProcessImageNameW};
 
-    const WINDOWS_TO_UNIX_SECONDS: u64 = 11_644_473_600;
-    const TICKS_PER_SECOND: u64 = 10_000_000;
-    let ticks = ((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64;
-    let current_seconds = ticks
-        .checked_div(TICKS_PER_SECOND)
-        .and_then(|seconds| seconds.checked_sub(WINDOWS_TO_UNIX_SECONDS))
-        .context("invalid Windows process creation time")?;
-    let expected_seconds = process
+    let current_start_time = process_identity::process_start_time_from_handle(handle, process.pid)?;
+    let expected_start_time = process
         .start_time
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_secs())
         .with_context(|| format!("PID {} has no trusted start time", process.pid))?;
-    if current_seconds != expected_seconds {
+    if current_start_time != expected_start_time {
         bail!(
             "PID {} may now be a different process. Reload and try again.",
             process.pid
+        );
+    }
+
+    let mut path_buffer = vec![0_u16; 32_768];
+    let mut path_length = path_buffer.len() as u32;
+    unsafe {
+        QueryFullProcessImageNameW(
+            handle,
+            Default::default(),
+            windows::core::PWSTR(path_buffer.as_mut_ptr()),
+            &mut path_length,
+        )
+        .with_context(|| format!("failed to read PID {} executable path", process.pid))?;
+    }
+    let path_length = usize::try_from(path_length).context("invalid executable path length")?;
+    let current_path = path_buffer
+        .get(..path_length)
+        .context("executable path length exceeded its buffer")?;
+    validate_executable_path(process, &String::from_utf16_lossy(current_path))?;
+
+    let mut critical = BOOL::default();
+    unsafe {
+        IsProcessCritical(handle, &mut critical)
+            .with_context(|| format!("failed to query whether PID {} is critical", process.pid))?;
+    }
+    if critical.as_bool() {
+        bail!(
+            "PID {} ({}) is marked critical by Windows and cannot be closed or killed",
+            process.pid,
+            process.name
         );
     }
     Ok(())
@@ -161,11 +163,14 @@ fn normalize_windows_path(path: &str) -> &str {
 }
 
 #[cfg(windows)]
-fn close_pid(pid: u32) -> anyhow::Result<usize> {
-    use windows::Win32::Foundation::{BOOL, HWND, LPARAM, WPARAM};
+fn close_pid(process: &ProcessInfo) -> anyhow::Result<usize> {
+    use windows::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, WPARAM};
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
     use windows::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GetWindowThreadProcessId, IsWindowVisible, PostMessageW, WM_CLOSE,
     };
+
+    let pid = process.pid;
 
     struct CloseSearch {
         pid: u32,
@@ -185,23 +190,30 @@ fn close_pid(pid: u32) -> anyhow::Result<usize> {
         BOOL(1)
     }
 
-    let mut search = CloseSearch { pid, posted: 0 };
     unsafe {
-        EnumWindows(
-            Some(enum_window),
-            LPARAM(&mut search as *mut CloseSearch as isize),
-        )
-        .with_context(|| format!("failed to enumerate windows for PID {pid}"))?;
-    }
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+            .with_context(|| format!("failed to open PID {pid} for window close"))?;
+        let result = (|| {
+            validate_process_handle(process, handle)?;
+            let mut search = CloseSearch { pid, posted: 0 };
+            EnumWindows(
+                Some(enum_window),
+                LPARAM(&mut search as *mut CloseSearch as isize),
+            )
+            .with_context(|| format!("failed to enumerate windows for PID {pid}"))?;
 
-    if search.posted == 0 {
-        bail!("PID {pid} has no visible top-level window to close");
+            if search.posted == 0 {
+                bail!("PID {pid} has no visible top-level window to close");
+            }
+            Ok(search.posted)
+        })();
+        let _ = CloseHandle(handle);
+        result
     }
-    Ok(search.posted)
 }
 
 #[cfg(not(windows))]
-fn close_pid(_pid: u32) -> anyhow::Result<usize> {
+fn close_pid(_process: &ProcessInfo) -> anyhow::Result<usize> {
     bail!("window close is implemented for Windows only")
 }
 
@@ -210,14 +222,11 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn validates_identity_from_an_open_process_handle() {
-        use super::{validate_creation_time, validate_executable_path};
+        use super::validate_process_handle;
         use crate::collectors::process_collector;
         use crate::settings::Settings;
-        use windows::Win32::Foundation::{CloseHandle, FILETIME};
-        use windows::Win32::System::Threading::{
-            GetProcessTimes, OpenProcess, QueryFullProcessImageNameW,
-            PROCESS_QUERY_LIMITED_INFORMATION,
-        };
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
         let processes = process_collector::collect_processes_for_action(&Settings::default())
             .expect("collect current process identity");
@@ -229,25 +238,7 @@ mod tests {
         unsafe {
             let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, current.pid)
                 .expect("open current process");
-            let mut creation = FILETIME::default();
-            let mut exit = FILETIME::default();
-            let mut kernel = FILETIME::default();
-            let mut user = FILETIME::default();
-            GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user)
-                .expect("get current process times");
-            validate_creation_time(current, creation).expect("creation time matches");
-
-            let mut path = vec![0_u16; 32_768];
-            let mut length = path.len() as u32;
-            QueryFullProcessImageNameW(
-                handle,
-                Default::default(),
-                windows::core::PWSTR(path.as_mut_ptr()),
-                &mut length,
-            )
-            .expect("query current process path");
-            validate_executable_path(current, &String::from_utf16_lossy(&path[..length as usize]))
-                .expect("executable path matches");
+            validate_process_handle(current, handle).expect("process identity matches");
             let _ = CloseHandle(handle);
         }
     }

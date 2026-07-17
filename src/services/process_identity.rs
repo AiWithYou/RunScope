@@ -1,24 +1,12 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
+#[cfg(any(windows, test))]
+use std::time::{Duration, UNIX_EPOCH};
 
-use anyhow::{anyhow, bail};
-use sysinfo::{Pid, ProcessRefreshKind, System, UpdateKind};
+use anyhow::anyhow;
+#[cfg(windows)]
+use anyhow::Context;
 
 use crate::model::ProcessInfo;
-
-pub fn ensure_current_process_matches(expected: &ProcessInfo) -> anyhow::Result<()> {
-    let current = current_identity(expected.pid)?;
-    if !identity_matches(
-        &expected.name,
-        expected.exe_path.as_deref(),
-        expected.start_time,
-        &current.name,
-        current.exe_path.as_deref(),
-        current.start_time,
-    ) {
-        return Err(pid_reused_error(expected.pid));
-    }
-    Ok(())
-}
 
 pub fn ensure_same_process(expected: &ProcessInfo, current: &ProcessInfo) -> anyhow::Result<()> {
     if !same_process(expected, current) {
@@ -69,30 +57,6 @@ pub fn target_list_changed(previous: &[ProcessInfo], current: &[ProcessInfo]) ->
     previous != current
 }
 
-fn current_identity(pid: u32) -> anyhow::Result<CurrentIdentity> {
-    let mut system = System::new();
-    system.refresh_processes_specifics(
-        ProcessRefreshKind::new()
-            .with_cmd(UpdateKind::Always)
-            .with_exe(UpdateKind::Always),
-    );
-
-    let Some(process) = system.process(Pid::from_u32(pid)) else {
-        bail!("PID {pid} no longer exists. Reload and try again.");
-    };
-    let start_time = if process.start_time() > 0 {
-        Some(UNIX_EPOCH + Duration::from_secs(process.start_time()))
-    } else {
-        None
-    };
-
-    Ok(CurrentIdentity {
-        name: process.name().to_string(),
-        exe_path: process.exe().map(|path| path.to_string_lossy().to_string()),
-        start_time,
-    })
-}
-
 fn identity_matches(
     expected_name: &str,
     expected_exe_path: Option<&str>,
@@ -123,15 +87,12 @@ fn paths_do_not_conflict(left: Option<&str>, right: Option<&str>) -> bool {
     }
 }
 
-fn identity_key(process: &ProcessInfo) -> (u32, String, Option<String>, Option<u64>) {
+fn identity_key(process: &ProcessInfo) -> (u32, String, Option<String>, Option<SystemTime>) {
     (
         process.pid,
         process.name.to_lowercase(),
         process.exe_path.as_ref().map(|path| path.to_lowercase()),
-        process
-            .start_time
-            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-            .map(|duration| duration.as_secs()),
+        process.start_time,
     )
 }
 
@@ -139,10 +100,56 @@ fn pid_reused_error(pid: u32) -> anyhow::Error {
     anyhow!("PID {pid} may now be a different process. Reload and try again.")
 }
 
-struct CurrentIdentity {
-    name: String,
-    exe_path: Option<String>,
-    start_time: Option<SystemTime>,
+#[cfg(windows)]
+pub(crate) fn process_start_time(pid: u32) -> anyhow::Result<SystemTime> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+            .with_context(|| format!("failed to open PID {pid} for creation-time query"))?;
+        let result = process_start_time_from_handle(handle, pid);
+        let _ = CloseHandle(handle);
+        result
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn process_start_time_from_handle(
+    handle: windows::Win32::Foundation::HANDLE,
+    pid: u32,
+) -> anyhow::Result<SystemTime> {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::Threading::GetProcessTimes;
+
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    unsafe {
+        GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user)
+            .with_context(|| format!("failed to read PID {pid} creation time"))?;
+    }
+    system_time_from_filetime(creation)
+}
+
+#[cfg(windows)]
+pub(crate) fn system_time_from_filetime(
+    creation: windows::Win32::Foundation::FILETIME,
+) -> anyhow::Result<SystemTime> {
+    const WINDOWS_TO_UNIX_SECONDS: u64 = 11_644_473_600;
+    const TICKS_PER_SECOND: u64 = 10_000_000;
+    const NANOS_PER_TICK: u64 = 100;
+
+    let ticks = ((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64;
+    let unix_ticks = ticks
+        .checked_sub(WINDOWS_TO_UNIX_SECONDS * TICKS_PER_SECOND)
+        .context("invalid Windows process creation time")?;
+    let duration = Duration::from_secs(unix_ticks / TICKS_PER_SECOND)
+        + Duration::from_nanos((unix_ticks % TICKS_PER_SECOND) * NANOS_PER_TICK);
+    UNIX_EPOCH
+        .checked_add(duration)
+        .context("Windows process creation time is out of range")
 }
 
 #[cfg(test)]
@@ -171,6 +178,29 @@ mod tests {
         let left = process(10, "python.exe", Some(r"C:\Python\python.exe"), 100);
         let right = process(10, "python.exe", Some(r"C:\Python\python.exe"), 101);
         assert!(!same_process(&left, &right));
+    }
+
+    #[test]
+    fn detects_reused_pid_within_the_same_second() {
+        let mut left = process(10, "python.exe", Some(r"C:\Python\python.exe"), 100);
+        let mut right = left.clone();
+        left.start_time = left.start_time.map(|time| time + Duration::from_nanos(100));
+        right.start_time = right
+            .start_time
+            .map(|time| time + Duration::from_nanos(200));
+
+        assert!(!same_process(&left, &right));
+    }
+
+    #[test]
+    fn target_list_detects_subsecond_identity_changes() {
+        let left = process(10, "python.exe", Some(r"C:\Python\python.exe"), 100);
+        let mut right = left.clone();
+        right.start_time = right
+            .start_time
+            .map(|time| time + Duration::from_nanos(100));
+
+        assert!(target_list_changed(&[left], &[right]));
     }
 
     #[test]
@@ -225,5 +255,25 @@ mod tests {
         let right = process(10, "python.exe", None, 100);
 
         assert!(same_process(&left, &right));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn preserves_windows_creation_time_subsecond_ticks() {
+        use windows::Win32::Foundation::FILETIME;
+
+        const WINDOWS_TO_UNIX_SECONDS: u64 = 11_644_473_600;
+        const TICKS_PER_SECOND: u64 = 10_000_000;
+        let ticks = (WINDOWS_TO_UNIX_SECONDS + 100) * TICKS_PER_SECOND + 123_456;
+        let creation = FILETIME {
+            dwLowDateTime: ticks as u32,
+            dwHighDateTime: (ticks >> 32) as u32,
+        };
+
+        let converted = system_time_from_filetime(creation).expect("valid FILETIME");
+        assert_eq!(
+            converted.duration_since(UNIX_EPOCH).expect("after epoch"),
+            Duration::from_secs(100) + Duration::from_nanos(12_345_600)
+        );
     }
 }

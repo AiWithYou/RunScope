@@ -1,0 +1,4 @@
+[advisories]
+# Block vulnerabilities everywhere, while treating unmaintained transitive crates as
+# an upstream upgrade concern. Direct unmaintained dependencies still fail the gate.
+unmaintained = "workspace"
