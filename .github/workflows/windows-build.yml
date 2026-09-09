@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - work/v2
   pull_request:
     branches:
       - main
@@ -49,6 +50,7 @@ jobs:
           name: RunScope-source
           path: RunScope-source.zip
           retention-days: 7
+          if-no-files-found: error
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
@@ -78,7 +80,72 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: RunScope-windows-x64
+          if-no-files-found: error
           path: |
             dist/RunScope.exe
             dist/RunScope-windows-x64.zip
             dist/SHA256SUMS.txt
+
+  # Opt in by using a [release] commit on main; ordinary pushes only validate.
+  publish:
+    needs: [advisories, build]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && contains(github.event.head_commit.message, '[release]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Checkout validated commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Publish exact validated package without replacing tags
+        shell: python
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          import hashlib, json, os, pathlib, re, subprocess, tomllib, zipfile
+          def gh(*args):
+              return subprocess.check_output(['gh', *args], text=True)
+          repo = os.environ['GITHUB_REPOSITORY']
+          sha = os.environ['GITHUB_SHA']
+          version = tomllib.loads(pathlib.Path('Cargo.toml').read_text())['package']['version']
+          if not re.fullmatch(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', version):
+              raise RuntimeError('Only stable SemVer releases are allowed')
+          tag = 'v' + version
+          refs = json.loads(gh('api', f'repos/{repo}/git/matching-refs/tags/{tag}'))
+          if any(ref['ref'] == f'refs/tags/{tag}' for ref in refs):
+              raise RuntimeError(f'{tag} already exists; tags and assets are never overwritten')
+          current = json.loads(gh('api', f'repos/{repo}/git/ref/heads/main'))
+          if current['object']['sha'] != sha:
+              raise RuntimeError('main advanced during validation; refusing a stale automatic release')
+          gh('run', 'download', os.environ['GITHUB_RUN_ID'], '--repo', repo,
+             '--name', 'RunScope-windows-x64', '--dir', 'dist')
+          dist = pathlib.Path('dist')
+          checksums = {}
+          for line in (dist / 'SHA256SUMS.txt').read_text().splitlines():
+              digest, name = line.split(None, 1)
+              if name not in ('RunScope.exe', 'RunScope-windows-x64.zip') or name in checksums:
+                  raise RuntimeError('Unexpected checksum manifest entry')
+              if hashlib.sha256((dist / name).read_bytes()).hexdigest() != digest:
+                  raise RuntimeError(f'Checksum mismatch: {name}')
+              checksums[name] = digest
+          if len(checksums) != 2:
+              raise RuntimeError('Incomplete checksum manifest')
+          with zipfile.ZipFile(dist / 'RunScope-windows-x64.zip') as package:
+              if hashlib.sha256(package.read('RunScope.exe')).hexdigest() != checksums['RunScope.exe']:
+                  raise RuntimeError('Packaged executable differs from the tested executable')
+          changelog = pathlib.Path('CHANGELOG.md').read_text(encoding='utf-8')
+          marker = f'## {version} '
+          if marker not in changelog:
+              raise RuntimeError('Missing release notes for package version')
+          notes = marker + changelog.split(marker, 1)[1].split('\n## ', 1)[0]
+          notes += f'\n\nValidated commit: `{sha}`. Windows CI: https://github.com/{repo}/actions/runs/{os.environ["GITHUB_RUN_ID"]}\n'
+          notes += '\nWindows x64. The executable is not Authenticode-signed. See SHA256SUMS.txt to verify downloads.\n'
+          pathlib.Path('RELEASE_NOTES.md').write_text(notes, encoding='utf-8')
+          # gh creates a draft, uploads assets, then publishes; incomplete uploads are not published.
+          print(gh('release', 'create', tag, str(dist / 'RunScope.exe'),
+                   str(dist / 'RunScope-windows-x64.zip'), str(dist / 'SHA256SUMS.txt'),
+                   '--repo', repo, '--target', sha, '--title', f'RunScope {tag}',
+                   '--notes-file', 'RELEASE_NOTES.md', '--latest'))

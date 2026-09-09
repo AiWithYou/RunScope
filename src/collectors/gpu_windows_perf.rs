@@ -124,7 +124,7 @@ impl Query {
                     continue;
                 }
                 let address = item.szName.0 as usize;
-                if address < begin || address >= end || address % 2 != 0 {
+                if address < begin || address >= end || !address.is_multiple_of(2) {
                     continue;
                 }
                 let name_units =

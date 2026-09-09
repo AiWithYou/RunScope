@@ -5,6 +5,7 @@ No machine-specific logs are printed or uploaded; temporary recordings are remov
 """
 from __future__ import annotations
 import json
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -21,7 +22,8 @@ def checked(command: list[str], timeout: int = 90) -> subprocess.CompletedProces
 
 def main() -> int:
     exe = Path(sys.argv[1] if len(sys.argv) > 1 else "dist/RunScope.exe").resolve()
-    assert checked([str(exe), "--version"]).stdout.strip() == "RunScope 2.0.0"
+    version = checked([str(exe), "--version"]).stdout.strip()
+    assert re.fullmatch(r"RunScope [0-9]+\.[0-9]+\.[0-9]+", version), "invalid version output"
     assert subprocess.run([str(exe), "--record", "unused", "--interval", "0"], capture_output=True).returncode == 2
     with tempfile.TemporaryDirectory(prefix="runscope-smoke-") as folder:
         fixture = subprocess.Popen([sys.executable, str(Path(__file__).with_name("diagnostic_workload.py")), "--seconds", "10"],
@@ -50,6 +52,7 @@ def main() -> int:
         frames = [r["data"] for r in records if r["record"] == "frame"]
         assert len(frames) >= 3, "insufficient observations"
         assert records[0]["record"] == "header" and records[-1]["record"] == "end"
+        assert records[0]["data"]["app_version"] == version.removeprefix("RunScope ")
         all_processes = [p for frame in frames for p in frame["processes"]]
         assert any(p["pid"] == fixture.pid for p in all_processes)
         assert any(p["parent_pid"] == fixture.pid for p in all_processes), "child was not tracked"
