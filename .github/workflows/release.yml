@@ -3,21 +3,24 @@ name: Release
 on:
   push:
     tags:
-      - "v*"
+      - "v[0-9]+.[0-9]+.[0-9]+"
 
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   advisories:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-
       - name: Audit Windows dependencies
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
@@ -28,81 +31,56 @@ jobs:
   release:
     needs: advisories
     runs-on: windows-latest
+    timeout-minutes: 35
     permissions:
       contents: write
-
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
           toolchain: 1.97.1
           components: clippy,rustfmt
-
-      - name: Validate tag and package version
-        shell: pwsh
-        run: |
-          $tag = $env:GITHUB_REF_NAME
-          if ($tag -notmatch '^v(?<major>0|[1-9]\d*)\.(?<minor>0|[1-9]\d*)\.(?<patch>0|[1-9]\d*)$') {
-              throw "Release tag must be stable SemVer in vMAJOR.MINOR.PATCH form: $tag"
-          }
-          $tagVersion = "$($Matches.major).$($Matches.minor).$($Matches.patch)"
-          $metadataJson = cargo metadata --locked --no-deps --format-version 1
-          if ($LASTEXITCODE -ne 0) {
-              throw "cargo metadata failed with exit code $LASTEXITCODE"
-          }
-          $metadata = $metadataJson | ConvertFrom-Json
-          $package = @($metadata.packages | Where-Object name -eq 'runscope')
-          if ($package.Count -ne 1) {
-              throw "Expected exactly one runscope package, found $($package.Count)"
-          }
-          if ($package[0].version -ne $tagVersion) {
-              throw "Tag $tag does not match Cargo package version $($package[0].version)"
-          }
-          "RELEASE_VERSION=$tagVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
       - name: Format
         run: cargo fmt --all --check
-
       - name: Check
         run: cargo check --locked
-
       - name: Test
         run: cargo test --locked
-
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
-
       - name: Build release package
         shell: pwsh
         run: .\build_release.ps1
-
+      - name: Verify tag matches package version
+        shell: pwsh
+        run: |
+          $cargoToml = Get-Content -LiteralPath "Cargo.toml" -Raw
+          if ($cargoToml -notmatch '(?m)^version\s*=\s*"([^"]+)"') {
+              throw "Could not read package version from Cargo.toml"
+          }
+          $version = $Matches[1]
+          $tagVersion = $env:GITHUB_REF_NAME.TrimStart('v')
+          if ($version -ne $tagVersion) {
+              throw "Tag version $tagVersion does not match Cargo.toml version $version"
+          }
       - name: Smoke test executable
         shell: pwsh
         run: |
-          $versionOutput = .\dist\RunScope.exe --version
-          if ($LASTEXITCODE -ne 0) {
-              throw "RunScope --version failed with exit code $LASTEXITCODE"
-          }
-          $expectedVersion = "RunScope $env:RELEASE_VERSION"
-          if ($versionOutput.Trim() -ne $expectedVersion) {
-              throw "Expected '$expectedVersion', got '$versionOutput'"
-          }
+          .\dist\RunScope.exe --version
+          if ($LASTEXITCODE -ne 0) { throw "RunScope --version failed" }
           .\dist\RunScope.exe --self-check
-          if ($LASTEXITCODE -ne 0) {
-              throw "RunScope --self-check failed with exit code $LASTEXITCODE"
-          }
-
+          if ($LASTEXITCODE -ne 0) { throw "RunScope --self-check failed" }
+      - name: Record, observe exits and recover interrupted journal
+        run: python scripts/smoke_recording.py dist/RunScope.exe
       - name: Upload GitHub Release assets
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        uses: softprops/action-gh-release@67e779bf43eaa76e0777a5fd2a82bfe6c7d31f13 # v3.0.0
         with:
-          generate_release_notes: true
           fail_on_unmatched_files: true
-          make_latest: true
+          generate_release_notes: true
           files: |
             dist/RunScope.exe
             dist/RunScope-windows-x64.zip

@@ -1,5 +1,13 @@
 # RunScope Requirements
 
+## v2 extension
+
+The original inspector requirements below remain in force. The v2 recorder is opt-in,
+read-only, independent of filters/termination, and samples RAM, known VRAM, CPU and I/O
+on a worker. It follows verified process identities and descendants, preserves last
+observations, and exports bounded, recoverable local logs. See docs/RECORDING.md.
+The original no-CPU goal applies to the manual inspector, not the v2 recorder.
+
 ## Purpose
 
 RunScope is a lightweight Windows RAM/VRAM process inspector. It helps find and terminate unnecessary processes or process trees started by terminals, VS Code, WSL, Codex/Claude tools, Python, ComfyUI, Forge, Ollama, Node, and general desktop apps.
@@ -7,7 +15,7 @@ RunScope is a lightweight Windows RAM/VRAM process inspector. It helps find and 
 ## Non-Goals
 
 - Do not recreate Task Manager.
-- Do not implement CPU usage in the MVP.
+- No CPU polling in the manual inspector; opt-in CPU/I/O recording is supported in v2.
 - Do not poll process data every UI frame.
 - Do not default to realtime monitoring.
 - Do not use Electron, Tauri, Python GUI frameworks, or PySide.

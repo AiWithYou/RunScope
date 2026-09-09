@@ -11,6 +11,7 @@ pub struct ProcessInfo {
     pub command_line: Option<String>,
     pub cwd: Option<String>,
     pub start_time: Option<SystemTime>,
+    pub telemetry: Option<ProcessTelemetry>,
     pub ram_bytes: u64,
     pub virtual_memory_bytes: u64,
     pub ram_delta_bytes: Option<i64>,
@@ -321,7 +322,24 @@ impl SortPreset {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct ProcessTelemetry {
+    /// 100% represents one logical CPU. The first sample is unavailable, not zero.
+    pub cpu_percent: Option<f32>,
+    /// Cumulative process I/O counters; these are not physical-disk throughput.
+    pub read_bytes_total: u64,
+    pub write_bytes_total: u64,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SystemMemory {
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+    pub swap_used_bytes: u64,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct ProcessSnapshot {
+    pub system_memory: Option<SystemMemory>,
     pub processes: Vec<ProcessInfo>,
     pub vram_status: String,
     pub listener_status: String,

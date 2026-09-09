@@ -1,18 +1,47 @@
-# RunScope
+# RunScope 2 — AI作業の記録とプロセス整理
 
-[日本語](#runscope) / [English](#runscope-english) / [日本語 standalone](README.ja.md)
+**Windows向けの軽量プロセスインスペクター + 明示的に開始するフライトレコーダー。**
+通常起動は従来どおり手動ロードです。v2では「止まった後に何も分からない」を減らすため、
+対象プロセスと子プロセスのRAM・既知VRAM・CPU・I/Oを時系列で記録できます。
+
+## v2.0.0の追加機能
+
+- **Flight recorder**：AIワークロード候補、選択プロセスツリー、全プロセスから選択。
+- **PID再利用を分離**：プロセス作成時刻まで照合し、親が消えた後も既知の子を継続追跡。
+- **終了前の観測値**：消失イベントに直前の値を残す。正常終了・クラッシュは断定しない。
+- **JSONL / JSON / HTML**：全記録と上限付きサマリー。途中で切れた末尾からの復旧に対応。
+- **低負荷を意識した収集**：CPU履歴の継続、メタデータ再取得の削減、ネイティブPDHによるVRAM取得。
+- **機密情報は既定で除外**：コマンドライン・EXEパス・CWDの記録は明示的な選択制。
+
+使い方と仕様は [フライトレコーダーガイド](docs/RECORDING.md)、変更一覧は [CHANGELOG](CHANGELOG.md) を参照してください。
+実測していない高速化率や、GPUドライバーを問わない取得保証はありません。
+
+### まず使う
+
+**Load / Reload → 対象を選択 → Flight recorder → Selected process tree → Start recording**。
+問題を再現した後に **Stop and write reports**。**Open HTML report** で履歴を確認します。
+レコーダー画面を閉じても記録は継続し、アプリを閉じると停止・保存します。
+
+```powershell
+.\RunScope.exe --record .\recordings --pid 12345 --duration 300 --interval 2
+.\RunScope.exe --report .\recordings\session-...\samples.jsonl
+```
+
+既定は5秒間隔・256 MiBまで。JSON/HTMLは最新600点・256イベントの要約で、完全な履歴はJSONLです。
+`N/A` / `null` は不明値で、ゼロとは区別します。GPU使用率や終了コードは取得しません。
+既存の設定、検索、Local Web、Close / Kill / Kill Treeの確認・保護は維持しています。
+
+---
+
+## Process inspector / 従来機能
+
+[日本語](#runscope-2--ai作業の記録とプロセス整理) / [English](#runscope-english) / [日本語 standalone](README.ja.md)
 
 Windows向けの軽量RAM/VRAMプロセスインスペクターです。
 
 RunScopeは、実行中プロセスのRAM、NVIDIA VRAM、ローカルWeb UI候補を手動で確認するための小さなネイティブデスクトップツールです。AI、Python、ComfyUI、Forge、Ollama、Node、VS Code、ターミナル、WSL、Codex/Claude系ツールを使った作業後のプロセス整理を想定しています。
 
-このアプリはデフォルトで手動ロード方式です。起動直後にプロセス収集せず、UIフレームごとの監視もしません。MVPではCPU使用率も取得しません。最新の状態を見たいときだけ `Load / Reload` を押します。
-
-## スクリーンショット
-
-![RunScope GUI](docs/images/runscope-main.png)
-
-スクリーンショットは `Load / Reload` 後に実際のプロセス一覧を表示している画面例です。
+このアプリはデフォルトで手動ロード方式です。起動直後にプロセス収集せず、UIフレームごとの監視もしません。インスペクター単独ではCPU使用率を取得しません。CPU・I/Oは明示的に開始したレコーダーで取得します。最新の状態を見たいときだけ `Load / Reload` を押します。
 
 ## 目的
 
@@ -153,7 +182,7 @@ Advancedでは次の列も追加表示します。
 - `Executable Path`
 - `Command Line`
 
-Path、Command Line、CWD、Virtual MemoryはCompactでは下部詳細パネルに表示します。MVPではCPU列はありません。
+Path、Command Line、CWD、Virtual MemoryはCompactでは下部詳細パネルに表示します。インスペクターのテーブルにはCPU列はありません。
 
 2回目以降のLoadでは、同じプロセスidentity（PID、名前、開始時刻、取得できる場合はPath）だけを比較し、RAM / VRAMの増減を括弧内に表示します。PIDが再利用された場合は別プロセスとして扱います。
 
@@ -308,7 +337,7 @@ GUIを起動しない診断:
 - Windows専用のデスクトップアプリです。
 - NVIDIA VRAM表示は、NVML、Windows GPU counters、または `nvidia-smi` の利用可否に依存します。
 - `Local Web` はTCP LISTENソケットから作る候補URLであり、HTTP endpointとして検証済みではありません。
-- MVPではCPU使用率は実装していません。
+- CPU・I/Oの時系列取得はv2のFlight recorderで使用できます。通常の一覧は手動スナップショットです。
 - プロセス情報はスナップショット方式です。最新状態を見るには `Load / Reload` を押してください。
 
 ## ライセンス
@@ -319,19 +348,20 @@ MITです。詳細は [LICENSE](LICENSE) を参照してください。
 
 # RunScope English
 
-[日本語](#runscope) / [Japanese standalone](README.ja.md)
+[日本語](#runscope-2--ai作業の記録とプロセス整理) / [Japanese standalone](README.ja.md)
 
 Lightweight RAM/VRAM Process Inspector for Windows.
 
 RunScope is a small native desktop tool for manually inspecting RAM, NVIDIA VRAM, and localhost-style web listeners owned by running processes. It is built for cleanup during AI, Python, ComfyUI, Forge, Ollama, Node, VS Code, terminal, WSL, and Codex/Claude-style development workflows.
 
-The app is intentionally manual by default. It does not collect process data on startup, does not poll every UI frame, and does not sample CPU usage in the MVP. Press `Load / Reload` when you want a fresh snapshot.
+The app is intentionally manual by default. It does not collect process data on startup, does not poll every UI frame, and samples CPU/I/O only in the explicitly started v2 recorder. Press `Load / Reload` when you want a fresh snapshot.
 
-## Screenshot
+## Flight recorder (v2)
 
-![RunScope GUI](docs/images/runscope-main.png)
-
-The screenshot shows a real loaded process snapshot after pressing `Load / Reload`.
+Opt-in GUI and headless recording follows selected process trees or AI workload candidates.
+RAM, known VRAM, CPU and process I/O are stored in a recoverable JSONL journal with offline
+JSON/HTML summaries. The inspector remains manual by default. See [the recording guide](docs/RECORDING.md).
+Environment-specific process screenshots are intentionally omitted from the documentation and package.
 
 ## Why
 
@@ -471,7 +501,7 @@ Advanced also shows:
 - `Executable Path`
 - `Command Line`
 
-Path, Command Line, CWD, and Virtual Memory remain available in the bottom detail panel in Compact mode. There is no CPU column in the MVP.
+Path, Command Line, CWD, and Virtual Memory remain available in the bottom detail panel in Compact mode. There is no CPU column in the inspector table; CPU sampling is in the v2 recorder.
 
 From the second load onward, RunScope compares only matching process identities (PID, name, start time, and path when available). PID reuse is treated as an exited process plus a newly started process.
 
@@ -626,7 +656,7 @@ Run diagnostics without starting the GUI:
 - Windows-only desktop app.
 - NVIDIA VRAM support depends on NVML, Windows GPU counters, or `nvidia-smi` availability.
 - Local Web entries are candidate URLs from TCP LISTEN sockets, not verified HTTP endpoints.
-- CPU usage is intentionally not implemented in the MVP.
+- CPU and process I/O sampling are available in the opt-in v2 recorder.
 - Process data is snapshot-based; press `Load / Reload` for current data.
 
 ## License
