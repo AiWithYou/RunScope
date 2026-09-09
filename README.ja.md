@@ -337,7 +337,7 @@ GUIを起動しない診断:
 - Windows専用のデスクトップアプリです。
 - NVIDIA VRAM表示は、NVML、Windows GPU counters、または `nvidia-smi` の利用可否に依存します。
 - `Local Web` はTCP LISTENソケットから作る候補URLであり、HTTP endpointとして検証済みではありません。
-- MVPではCPU使用率は実装していません。
+- CPU・I/Oの時系列取得はv2のFlight recorderで使用できます。通常の一覧は手動スナップショットです。
 - プロセス情報はスナップショット方式です。最新状態を見るには `Load / Reload` を押してください。
 
 ## ライセンス

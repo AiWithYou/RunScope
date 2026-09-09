@@ -187,12 +187,17 @@ fn record(
     })();
     let reason = match &result {
         Ok(reason) => reason.clone(),
-        Err(error) => format!("collection error: {error:#}"),
+        Err(error) => format!("recording error: {error:#}"),
     };
     // Reserve no in-memory backlog. If the journal is full, derived reports still explain the stop.
-    let end_result = journal.append(&Record::End {
-        reason: reason.clone(),
-    });
+    let end_result = if result.is_ok() {
+        journal.append(&Record::End {
+            reason: reason.clone(),
+        })
+    } else {
+        // An I/O error may have left a partial final line. Leave it recoverable.
+        Ok(false)
+    };
     let sync_result = journal.sync();
     let report = Report {
         header,

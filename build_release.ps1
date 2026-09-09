@@ -40,6 +40,10 @@ New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "docs") | Out-N
 Copy-Item -LiteralPath "docs\RECORDING.md" -Destination (Join-Path $packageDir "docs\RECORDING.md") -Force
 Copy-Item -LiteralPath "CHANGELOG.md" -Destination (Join-Path $packageDir "CHANGELOG.md") -Force
 
+New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "scripts") | Out-Null
+Copy-Item -LiteralPath "scripts\diagnostic_workload.py" -Destination (Join-Path $packageDir "scripts\diagnostic_workload.py") -Force
+Copy-Item -LiteralPath "scripts\smoke_recording.py" -Destination (Join-Path $packageDir "scripts\smoke_recording.py") -Force
+
 Compress-Archive -Path (Join-Path $packageDir "*") -DestinationPath $zipPath -Force
 Remove-Item -LiteralPath $packageDir -Recurse -Force
 

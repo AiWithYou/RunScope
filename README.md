@@ -337,7 +337,7 @@ GUIを起動しない診断:
 - Windows専用のデスクトップアプリです。
 - NVIDIA VRAM表示は、NVML、Windows GPU counters、または `nvidia-smi` の利用可否に依存します。
 - `Local Web` はTCP LISTENソケットから作る候補URLであり、HTTP endpointとして検証済みではありません。
-- MVPではCPU使用率は実装していません。
+- CPU・I/Oの時系列取得はv2のFlight recorderで使用できます。通常の一覧は手動スナップショットです。
 - プロセス情報はスナップショット方式です。最新状態を見るには `Load / Reload` を押してください。
 
 ## ライセンス
@@ -354,13 +354,14 @@ Lightweight RAM/VRAM Process Inspector for Windows.
 
 RunScope is a small native desktop tool for manually inspecting RAM, NVIDIA VRAM, and localhost-style web listeners owned by running processes. It is built for cleanup during AI, Python, ComfyUI, Forge, Ollama, Node, VS Code, terminal, WSL, and Codex/Claude-style development workflows.
 
-The app is intentionally manual by default. It does not collect process data on startup, does not poll every UI frame, and does not sample CPU usage in the MVP. Press `Load / Reload` when you want a fresh snapshot.
+The app is intentionally manual by default. It does not collect process data on startup, does not poll every UI frame, and samples CPU/I/O only in the explicitly started v2 recorder. Press `Load / Reload` when you want a fresh snapshot.
 
-## Screenshot
+## Flight recorder (v2)
 
-![RunScope GUI](docs/images/runscope-main.png)
-
-The screenshot shows a real loaded process snapshot after pressing `Load / Reload`.
+Opt-in GUI and headless recording follows selected process trees or AI workload candidates.
+RAM, known VRAM, CPU and process I/O are stored in a recoverable JSONL journal with offline
+JSON/HTML summaries. The inspector remains manual by default. See [the recording guide](docs/RECORDING.md).
+Environment-specific process screenshots are intentionally omitted from the documentation and package.
 
 ## Why
 
@@ -500,7 +501,7 @@ Advanced also shows:
 - `Executable Path`
 - `Command Line`
 
-Path, Command Line, CWD, and Virtual Memory remain available in the bottom detail panel in Compact mode. There is no CPU column in the MVP.
+Path, Command Line, CWD, and Virtual Memory remain available in the bottom detail panel in Compact mode. There is no CPU column in the inspector table; CPU sampling is in the v2 recorder.
 
 From the second load onward, RunScope compares only matching process identities (PID, name, start time, and path when available). PID reuse is treated as an exited process plus a newly started process.
 
@@ -655,7 +656,7 @@ Run diagnostics without starting the GUI:
 - Windows-only desktop app.
 - NVIDIA VRAM support depends on NVML, Windows GPU counters, or `nvidia-smi` availability.
 - Local Web entries are candidate URLs from TCP LISTEN sockets, not verified HTTP endpoints.
-- CPU usage is intentionally not implemented in the MVP.
+- CPU and process I/O sampling are available in the opt-in v2 recorder.
 - Process data is snapshot-based; press `Load / Reload` for current data.
 
 ## License

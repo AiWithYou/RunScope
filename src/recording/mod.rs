@@ -376,15 +376,14 @@ impl Tracker {
                 totals.cpu_known_count += 1;
             }
             if let Some(key) = &process.identity {
-                let old = self.previous.get(key);
-                let kind = if old.is_none() {
-                    Some("first_seen")
-                } else if process.ram_bytes.saturating_sub(old.unwrap().ram_bytes)
-                    >= 256 * 1024 * 1024
-                {
-                    Some("ram_growth")
-                } else {
-                    None
+                let kind = match self.previous.get(key) {
+                    None => Some("first_seen"),
+                    Some(old)
+                        if process.ram_bytes.saturating_sub(old.ram_bytes) >= 256 * 1024 * 1024 =>
+                    {
+                        Some("ram_growth")
+                    }
+                    _ => None,
                 };
                 if let Some(kind) = kind {
                     events.push(Event {
@@ -619,14 +618,15 @@ mod tests {
         let mut tracker = all();
         let mut summary = Summary::default();
         for n in 0..5000 {
-            let frame = tracker.sample(snapshot(vec![p(1, n + 1, None, 5000 - n)]), n, 0);
+            let frame = tracker.sample(snapshot(vec![p(1, (n + 1) * 100, None, 5000 - n)]), n, 0);
             summary.push(&frame, 1000);
         }
         assert_eq!(summary.points.len(), PREVIEW_LIMIT);
         assert_eq!(summary.events.len(), EVENT_LIMIT);
         assert_eq!(summary.peak_ram_bytes, 5000);
         assert_eq!(summary.sample_count, 5000);
-        assert!(summary.omitted_events > 0);
+        assert_eq!(summary.omitted_events, 9999 - EVENT_LIMIT as u64);
+        assert_eq!(summary.omitted_preview_points, 5000 - PREVIEW_LIMIT as u64);
     }
     #[test]
     fn config_rejects_unbounded_or_busy_loop_inputs() {

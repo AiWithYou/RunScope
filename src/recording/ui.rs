@@ -68,7 +68,8 @@ impl DiagnosticsApp {
         let active = self.active();
         let mut open = self.show_recorder;
         egui::Window::new("Flight recorder · RunScope 2").open(&mut open)
-            .default_size([790.0, 580.0]).resizable(true).show(ctx, |ui| {
+            .default_size([790.0, 580.0]).resizable(true)
+            .vscroll(true).show(ctx, |ui| {
                 ui.label("Record an AI workload without changing the process inspector. No automatic termination.");
                 ui.add_enabled_ui(!active, |ui| {
                     ui.horizontal(|ui| {
@@ -219,7 +220,7 @@ fn draw_chart(ui: &mut egui::Ui, points: &[Point]) {
             )
         })
         .collect();
-    let stroke = egui::Stroke::new(1.5, ui.visuals().selection.bg_fill);
+    let stroke = egui::Stroke::new(1.5_f32, ui.visuals().selection.bg_fill);
     for pair in positions.windows(2) {
         painter.line_segment([pair[0], pair[1]], stroke);
     }

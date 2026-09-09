@@ -21,6 +21,7 @@ pub struct Journal {
     pub directory: PathBuf,
     pub bytes: u64,
     limit: u64,
+    failed: bool,
 }
 
 impl Journal {
@@ -54,6 +55,7 @@ impl Journal {
             directory,
             bytes: 0,
             limit: header.config.max_log_bytes,
+            failed: false,
         };
         ensure!(
             journal.append(&Record::Header(header.clone()))?,
@@ -64,6 +66,10 @@ impl Journal {
 
     /// Returns false before writing if the record would exceed the configured limit.
     pub fn append(&mut self, record: &Record) -> anyhow::Result<bool> {
+        ensure!(
+            !self.failed,
+            "journal has a failed write; preserve its recoverable prefix"
+        );
         let mut bytes = serde_json::to_vec(record)?;
         ensure!(
             bytes.len() < MAX_LINE_BYTES,
@@ -73,9 +79,12 @@ impl Journal {
         if self.bytes.saturating_add(bytes.len() as u64) > self.limit {
             return Ok(false);
         }
+        // A partial write must remain the final record; never append an end marker to it.
+        self.failed = true;
         self.file.write_all(&bytes)?;
         self.file.flush()?;
         self.bytes += bytes.len() as u64;
+        self.failed = false;
         Ok(true)
     }
 
@@ -375,6 +384,56 @@ mod tests {
         let journal = Journal::create(&root, &header).unwrap();
         assert!(recover(&journal.directory.join("samples.jsonl")).is_err());
         drop(journal);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn disk_cap_stops_before_writing_an_extra_record() {
+        let root = root();
+        let mut journal = Journal::create(&root, &Header::new(Config::default())).unwrap();
+        let path = journal.directory.join("samples.jsonl");
+        let before = journal.bytes;
+        journal.limit = before;
+        assert!(!journal
+            .append(&Record::End {
+                reason: "done".into()
+            })
+            .unwrap());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), before);
+        drop(journal);
+        assert_eq!(recover(&path).unwrap().summary.sample_count, 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_write_preserves_tail_and_rejects_subsequent_records() {
+        let root = root();
+        let mut journal = Journal::create(&root, &Header::new(Config::default())).unwrap();
+        let path = journal.directory.join("samples.jsonl");
+        // Model the state after a short write followed by an I/O failure.
+        journal.file.write_all(b"{\"record\":").unwrap();
+        journal.failed = true;
+        let before = std::fs::metadata(&path).unwrap().len();
+        assert!(journal
+            .append(&Record::End {
+                reason: "done".into()
+            })
+            .is_err());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), before);
+        drop(journal);
+        assert!(recover(&path).unwrap().completion.contains("incomplete"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn duplicate_header_is_not_silently_accepted() {
+        let root = root();
+        let header = Header::new(Config::default());
+        let mut journal = Journal::create(&root, &header).unwrap();
+        journal.append(&Record::Header(header)).unwrap();
+        let path = journal.directory.join("samples.jsonl");
+        drop(journal);
+        assert!(recover(&path).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 }
