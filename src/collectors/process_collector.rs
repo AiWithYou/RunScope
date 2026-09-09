@@ -1,66 +1,125 @@
 use crate::collectors::{gpu_nvidia_smi, gpu_nvml, gpu_windows_perf, local_listeners};
-use crate::model::{GpuProcessInfo, ProcessInfo, ProcessSnapshot, SnapshotState};
+use crate::model::{
+    GpuProcessInfo, ProcessInfo, ProcessSnapshot, ProcessTelemetry, SnapshotState, SystemMemory,
+};
 use crate::services::{process_identity, scope_detector};
 use crate::settings::Settings;
 use anyhow::{bail, Context};
-use std::collections::HashMap;
-use std::sync::{mpsc, OnceLock};
+use std::collections::{HashMap, HashSet};
+use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread;
 #[cfg(any(not(windows), test))]
 use std::time::UNIX_EPOCH;
 use std::time::{Duration, Instant};
 use sysinfo::{ProcessRefreshKind, System, UpdateKind};
 
-pub fn collect_processes(settings: &Settings) -> anyhow::Result<ProcessSnapshot> {
-    let total_started = Instant::now();
-    let (
-        ((vram_by_pid, vram_status), vram_elapsed),
-        ((listeners_by_pid, listener_status), listener_elapsed),
-    ) = thread::scope(|scope| {
-        let vram_worker = scope.spawn(|| {
-            let started = Instant::now();
-            (collect_vram(), started.elapsed())
-        });
-        let listener_worker = scope.spawn(|| {
-            let started = Instant::now();
-            (collect_listeners(), started.elapsed())
-        });
-        let vram = vram_worker.join().unwrap_or_else(|_| {
-            (
-                (
-                    HashMap::new(),
-                    "VRAM unavailable: collector worker panicked".to_string(),
-                ),
-                Duration::ZERO,
-            )
-        });
-        let listeners = listener_worker.join().unwrap_or_else(|_| {
-            (
-                (
-                    HashMap::new(),
-                    "Local listeners unavailable: collector worker panicked".to_string(),
-                ),
-                Duration::ZERO,
-            )
-        });
-        (vram, listeners)
-    });
-    let process_started = Instant::now();
-    let processes = collect_process_infos(settings, vram_by_pid, listeners_by_pid);
-    let process_elapsed = process_started.elapsed();
+/// Retains sysinfo's process and CPU baselines between samples. UI rendering never polls it.
+#[derive(Default)]
+pub struct ProcessCollector {
+    system: System,
+    previous_identities: HashSet<(u32, std::time::SystemTime)>,
+}
 
-    Ok(ProcessSnapshot {
-        processes,
-        vram_status,
-        listener_status,
-        timing_status: format!(
-            "Load: {} (VRAM {}, listeners {}, processes {})",
-            duration_text(total_started.elapsed()),
-            duration_text(vram_elapsed),
-            duration_text(listener_elapsed),
-            duration_text(process_elapsed)
-        ),
-    })
+pub fn collect_processes(settings: &Settings) -> anyhow::Result<ProcessSnapshot> {
+    static COLLECTOR: OnceLock<Mutex<ProcessCollector>> = OnceLock::new();
+    COLLECTOR
+        .get_or_init(|| Mutex::new(ProcessCollector::default()))
+        .lock()
+        .map_err(|_| anyhow::anyhow!("process collector lock poisoned"))?
+        .collect(settings, false)
+}
+
+impl ProcessCollector {
+    pub fn collect(
+        &mut self,
+        settings: &Settings,
+        telemetry: bool,
+    ) -> anyhow::Result<ProcessSnapshot> {
+        let total_started = Instant::now();
+        // Collect process metadata while the two independent collectors are running.
+        let (mut processes, process_elapsed, vram, listeners) = thread::scope(|scope| {
+            let vram_worker = scope.spawn(|| {
+                let started = Instant::now();
+                (collect_vram(), started.elapsed())
+            });
+            let listener_worker = scope.spawn(|| {
+                let started = Instant::now();
+                (collect_listeners(), started.elapsed())
+            });
+            let started = Instant::now();
+            let processes = collect_process_infos(
+                settings,
+                &mut self.system,
+                telemetry,
+                &self.previous_identities,
+                HashMap::new(),
+                HashMap::new(),
+            );
+            let elapsed = started.elapsed();
+            let vram = vram_worker.join().unwrap_or_else(|_| {
+                (
+                    (
+                        HashMap::new(),
+                        "VRAM unavailable: collector worker panicked".to_string(),
+                    ),
+                    Duration::ZERO,
+                )
+            });
+            let listeners = listener_worker.join().unwrap_or_else(|_| {
+                (
+                    (
+                        HashMap::new(),
+                        "Local listeners unavailable: collector worker panicked".to_string(),
+                    ),
+                    Duration::ZERO,
+                )
+            });
+            (processes, elapsed, vram, listeners)
+        });
+        let ((mut vram_by_pid, vram_status), vram_elapsed) = vram;
+        let ((mut listeners_by_pid, listener_status), listener_elapsed) = listeners;
+        for process in &mut processes {
+            process.gpu = vram_by_pid
+                .remove(&process.pid)
+                .map(|usage| GpuProcessInfo {
+                    device_indices: usage.device_indices,
+                    device_names: usage.device_names,
+                    vram_bytes: Some(usage.bytes),
+                    process_type: usage.process_type,
+                });
+            process.local_endpoints = listeners_by_pid.remove(&process.pid).unwrap_or_default();
+        }
+        scope_detector::assign_scopes(&mut processes, settings);
+        self.previous_identities.clear();
+        let system_memory = if telemetry {
+            self.previous_identities.extend(
+                processes
+                    .iter()
+                    .filter_map(|p| p.start_time.map(|t| (p.pid, t))),
+            );
+            self.system.refresh_memory();
+            Some(SystemMemory {
+                total_bytes: self.system.total_memory(),
+                available_bytes: self.system.available_memory(),
+                swap_used_bytes: self.system.used_swap(),
+            })
+        } else {
+            None
+        };
+        Ok(ProcessSnapshot {
+            system_memory,
+            processes,
+            vram_status,
+            listener_status,
+            timing_status: format!(
+                "Load: {} (VRAM {}, listeners {}, processes {})",
+                duration_text(total_started.elapsed()),
+                duration_text(vram_elapsed),
+                duration_text(listener_elapsed),
+                duration_text(process_elapsed)
+            ),
+        })
+    }
 }
 
 fn duration_text(duration: Duration) -> String {
@@ -76,6 +135,9 @@ pub fn collect_processes_for_action(settings: &Settings) -> anyhow::Result<Vec<P
         .context("failed to collect local listeners for action confirmation")?;
     Ok(collect_process_infos(
         settings,
+        &mut System::new(),
+        false,
+        &HashSet::new(),
         HashMap::new(),
         listeners_by_pid,
     ))
@@ -83,17 +145,21 @@ pub fn collect_processes_for_action(settings: &Settings) -> anyhow::Result<Vec<P
 
 fn collect_process_infos(
     settings: &Settings,
+    system: &mut System,
+    telemetry: bool,
+    previous_identities: &HashSet<(u32, std::time::SystemTime)>,
     mut vram_by_pid: HashMap<u32, gpu_nvml::VramUsage>,
     mut listeners_by_pid: HashMap<u32, Vec<crate::model::ListeningEndpoint>>,
 ) -> Vec<ProcessInfo> {
-    let mut system = System::new();
-    system.refresh_processes_specifics(
-        ProcessRefreshKind::new()
-            .with_memory()
-            .with_cmd(UpdateKind::Always)
-            .with_exe(UpdateKind::Always)
-            .with_cwd(UpdateKind::Always),
-    );
+    let mut refresh = ProcessRefreshKind::new()
+        .with_memory()
+        .with_cmd(UpdateKind::OnlyIfNotSet)
+        .with_exe(UpdateKind::OnlyIfNotSet)
+        .with_cwd(UpdateKind::Always);
+    if telemetry {
+        refresh = refresh.with_cpu().with_disk_usage();
+    }
+    system.refresh_processes_specifics(refresh);
 
     let mut processes = Vec::with_capacity(system.processes().len());
 
@@ -129,6 +195,17 @@ fn collect_process_infos(
             command_line,
             cwd,
             start_time,
+            telemetry: telemetry.then(|| {
+                let io = process.disk_usage();
+                let cpu = process.cpu_usage();
+                ProcessTelemetry {
+                    cpu_percent: start_time
+                        .filter(|time| previous_identities.contains(&(pid_u32, *time)))
+                        .and_then(|_| (cpu.is_finite() && cpu >= 0.0).then_some(cpu)),
+                    read_bytes_total: io.total_read_bytes,
+                    write_bytes_total: io.total_written_bytes,
+                }
+            }),
             ram_bytes: process.memory(),
             virtual_memory_bytes: process.virtual_memory(),
             ram_delta_bytes: None,

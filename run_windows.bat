@@ -1,16 +1,13 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-
-if exist "dist\RunScope.exe" (
-  "dist\RunScope.exe"
-  exit /b %ERRORLEVEL%
-)
-
-if exist "target\release\runscope.exe" (
-  "target\release\runscope.exe"
-  exit /b %ERRORLEVEL%
-)
-
-cargo run --release
-endlocal
+if exist "dist\RunScope.exe" goto dist
+if exist "target\release\runscope.exe" goto release
+cargo run --release -- %*
+exit /b %ERRORLEVEL%
+:dist
+"dist\RunScope.exe" %*
+exit /b %ERRORLEVEL%
+:release
+"target\release\runscope.exe" %*
+exit /b %ERRORLEVEL%

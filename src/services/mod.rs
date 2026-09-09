@@ -1,3 +1,4 @@
+pub mod atomic_file;
 pub mod command_timeout;
 pub mod formatter;
 pub mod process_identity;

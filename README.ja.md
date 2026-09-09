@@ -1,4 +1,39 @@
-# RunScope
+# RunScope 2 — AI作業の記録とプロセス整理
+
+**Windows向けの軽量プロセスインスペクター + 明示的に開始するフライトレコーダー。**
+通常起動は従来どおり手動ロードです。v2では「止まった後に何も分からない」を減らすため、
+対象プロセスと子プロセスのRAM・既知VRAM・CPU・I/Oを時系列で記録できます。
+
+## v2.0.0の追加機能
+
+- **Flight recorder**：AIワークロード候補、選択プロセスツリー、全プロセスから選択。
+- **PID再利用を分離**：プロセス作成時刻まで照合し、親が消えた後も既知の子を継続追跡。
+- **終了前の観測値**：消失イベントに直前の値を残す。正常終了・クラッシュは断定しない。
+- **JSONL / JSON / HTML**：全記録と上限付きサマリー。途中で切れた末尾からの復旧に対応。
+- **低負荷を意識した収集**：CPU履歴の継続、メタデータ再取得の削減、ネイティブPDHによるVRAM取得。
+- **機密情報は既定で除外**：コマンドライン・EXEパス・CWDの記録は明示的な選択制。
+
+使い方と仕様は [フライトレコーダーガイド](docs/RECORDING.md)、変更一覧は [CHANGELOG](CHANGELOG.md) を参照してください。
+実測していない高速化率や、GPUドライバーを問わない取得保証はありません。
+
+### まず使う
+
+**Load / Reload → 対象を選択 → Flight recorder → Selected process tree → Start recording**。
+問題を再現した後に **Stop and write reports**。**Open HTML report** で履歴を確認します。
+レコーダー画面を閉じても記録は継続し、アプリを閉じると停止・保存します。
+
+```powershell
+.\RunScope.exe --record .\recordings --pid 12345 --duration 300 --interval 2
+.\RunScope.exe --report .\recordings\session-...\samples.jsonl
+```
+
+既定は5秒間隔・256 MiBまで。JSON/HTMLは最新600点・256イベントの要約で、完全な履歴はJSONLです。
+`N/A` / `null` は不明値で、ゼロとは区別します。GPU使用率や終了コードは取得しません。
+既存の設定、検索、Local Web、Close / Kill / Kill Treeの確認・保護は維持しています。
+
+---
+
+## Process inspector / 従来機能
 
 [GitHubトップ README](README.md) / [English](README.md#runscope-english)
 
@@ -6,13 +41,7 @@ Windows向けの軽量RAM/VRAMプロセスインスペクターです。
 
 RunScopeは、実行中プロセスのRAM、NVIDIA VRAM、ローカルWeb UI候補を手動で確認するための小さなネイティブデスクトップツールです。AI、Python、ComfyUI、Forge、Ollama、Node、VS Code、ターミナル、WSL、Codex/Claude系ツールを使った作業後のプロセス整理を想定しています。
 
-このアプリはデフォルトで手動ロード方式です。起動直後にプロセス収集せず、UIフレームごとの監視もしません。MVPではCPU使用率も取得しません。最新の状態を見たいときだけ `Load / Reload` を押します。
-
-## スクリーンショット
-
-![RunScope GUI](docs/images/runscope-main.png)
-
-スクリーンショットは `Load / Reload` 後に実際のプロセス一覧を表示している画面例です。
+このアプリはデフォルトで手動ロード方式です。起動直後にプロセス収集せず、UIフレームごとの監視もしません。インスペクター単独ではCPU使用率を取得しません。CPU・I/Oは明示的に開始したレコーダーで取得します。最新の状態を見たいときだけ `Load / Reload` を押します。
 
 ## 目的
 
@@ -153,7 +182,7 @@ Advancedでは次の列も追加表示します。
 - `Executable Path`
 - `Command Line`
 
-Path、Command Line、CWD、Virtual MemoryはCompactでは下部詳細パネルに表示します。MVPではCPU列はありません。
+Path、Command Line、CWD、Virtual MemoryはCompactでは下部詳細パネルに表示します。インスペクターのテーブルにはCPU列はありません。
 
 2回目以降のLoadでは、同じプロセスidentity（PID、名前、開始時刻、取得できる場合はPath）だけを比較し、RAM / VRAMの増減を括弧内に表示します。PIDが再利用された場合は別プロセスとして扱います。
 

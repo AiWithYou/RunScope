@@ -2,6 +2,7 @@ mod app;
 mod collectors;
 mod fonts;
 mod model;
+mod recording;
 mod services;
 mod settings;
 mod ui;
@@ -26,6 +27,24 @@ fn main() -> eframe::Result<()> {
     }
     if args.as_slice() == ["--help"] || args.as_slice() == ["-h"] {
         print_usage();
+        return Ok(());
+    }
+
+    if args
+        .first()
+        .is_some_and(|arg| arg == "--record" || arg == "--report")
+    {
+        let command = match recording::cli::parse(&args) {
+            Ok(command) => command,
+            Err(error) => {
+                eprintln!("Invalid arguments: {error:#}");
+                std::process::exit(2);
+            }
+        };
+        if let Err(error) = recording::cli::execute(command) {
+            eprintln!("RunScope recording failed: {error:#}");
+            std::process::exit(1);
+        }
         return Ok(());
     }
 
@@ -82,7 +101,7 @@ fn main() -> eframe::Result<()> {
             if load_on_start {
                 app.start_load(&cc.egui_ctx);
             }
-            Ok(Box::new(app))
+            Ok(Box::new(recording::ui::DiagnosticsApp::new(app)))
         }),
     )
 }
@@ -90,6 +109,8 @@ fn main() -> eframe::Result<()> {
 fn print_usage() {
     println!("RunScope {}", env!("CARGO_PKG_VERSION"));
     println!("Usage: RunScope.exe [--load] [--screenshot <output.bmp>]");
+    println!("       RunScope.exe --record <directory> [--pid <PID> | --all] [--duration <seconds>] [--interval <1..60>] [--max-log-mib <1..4096>] [--include-sensitive]");
+    println!("       RunScope.exe --report <samples.jsonl>");
     println!("       RunScope.exe --version");
     println!("       RunScope.exe --self-check");
 }
