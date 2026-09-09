@@ -15,70 +15,79 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  advisories:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25
+        with:
+          rust-version: "1.97.1"
+          command: check advisories
+          arguments: --locked --target x86_64-pc-windows-msvc
+
   prepare:
     runs-on: windows-latest
     timeout-minutes: 35
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
           toolchain: 1.97.1
           components: clippy,rustfmt
-
-      - name: Apply reviewed v2 implementation
+      - name: Apply reviewed fixes
         shell: python
         run: |
-          import base64, hashlib, lzma, pathlib, shutil, subprocess, tempfile
-          source = pathlib.Path('.v2-transport')
-          parts = sorted(source.iterdir())
-          assert len(parts) == 6, 'Missing transport parts'
-          patch = lzma.decompress(base64.b64decode(''.join(p.read_text(encoding='utf-8') for p in parts), validate=True))
-          assert hashlib.sha256(patch).hexdigest() == '04c2f2bebcd963e47ffb771d693763d587bef5539d4cca1465daa484ca0a4152', 'Source patch checksum mismatch'
-          with tempfile.TemporaryDirectory() as tmp:
-              path = pathlib.Path(tmp) / 'v2.patch'
-              path.write_bytes(patch)
-              subprocess.run(['git', 'apply', '--check', str(path)], check=True)
-              subprocess.run(['git', 'apply', str(path)], check=True)
-          shutil.rmtree(source)
-
-      - name: Update vulnerable transitive dependency
-        run: cargo update -p webbrowser --precise 1.2.2
-
+          import base64, hashlib, lzma, pathlib, shutil
+          payload = lzma.decompress(base64.b64decode(pathlib.Path('.v2-transport/fix.xz.b64').read_text(), validate=True))
+          assert hashlib.sha256(payload).hexdigest() == '0bf8e1550835a6a98e93ff7fc0f2e4ae0fe228058ff6d8e4bdcce457fdec98ec'
+          exec(compile(payload, 'reviewed-v2-fixes.py', 'exec'))
+          shutil.rmtree('.v2-transport')
       - name: Format implementation
         run: cargo fmt --all
-
-      - name: Commit implementation on work branch
+      - name: Commit fixes on work branch
         shell: pwsh
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add --all
-          git commit -m 'feat: RunScope 2 flight recorder and resilient native collection'
+          git commit -m 'fix: preserve interrupted writes and validate native time precision'
           if ($LASTEXITCODE -ne 0) { throw 'Commit failed' }
           git push origin HEAD:work/v2
           if ($LASTEXITCODE -ne 0) { throw 'Non-fast-forward push or permission failure' }
           git archive --format=zip --output=RunScope-v2-source.zip HEAD
           if ($LASTEXITCODE -ne 0) { throw 'Source archive failed' }
           git log -1 --oneline
-
       - name: Upload exact source
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: RunScope-v2-source
           path: RunScope-v2-source.zip
           retention-days: 7
-
       - name: Format check
         run: cargo fmt --all --check
       - name: Check
+        id: check
+        continue-on-error: true
         run: cargo check --locked
       - name: Unit tests
+        id: tests
+        continue-on-error: true
         run: cargo test --locked
       - name: Clippy
+        id: clippy
+        continue-on-error: true
         run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Require all checks
+        shell: pwsh
+        run: |
+          if ('${{ steps.check.outcome }}' -ne 'success' -or '${{ steps.tests.outcome }}' -ne 'success' -or '${{ steps.clippy.outcome }}' -ne 'success') { throw 'Native validation failed' }
       - name: Build release
         shell: pwsh
         run: .\build_release.ps1

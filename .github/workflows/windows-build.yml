@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-      - work/v2
   pull_request:
     branches:
       - main
@@ -21,13 +20,11 @@ jobs:
   advisories:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-
       - name: Audit Windows dependencies
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
@@ -38,58 +35,45 @@ jobs:
   build:
     runs-on: windows-latest
     timeout-minutes: 30
-
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-
       - name: Archive exact source
         shell: pwsh
         run: git archive --format=zip --output=RunScope-source.zip HEAD
-
       - name: Upload source archive
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: RunScope-source
           path: RunScope-source.zip
           retention-days: 7
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
           toolchain: 1.97.1
           components: clippy,rustfmt
-
       - name: Format
         run: cargo fmt --all --check
-
       - name: Check
         run: cargo check --locked
-
       - name: Test
         run: cargo test --locked
-
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
-
       - name: Build release package
         shell: pwsh
         run: .\build_release.ps1
-
       - name: Smoke test executable
         shell: pwsh
         run: |
           .\dist\RunScope.exe --version
-          if ($LASTEXITCODE -ne 0) {
-              throw "RunScope --version failed with exit code $LASTEXITCODE"
-          }
+          if ($LASTEXITCODE -ne 0) { throw "RunScope --version failed" }
           .\dist\RunScope.exe --self-check
-          if ($LASTEXITCODE -ne 0) {
-              throw "RunScope --self-check failed with exit code $LASTEXITCODE"
-          }
-
+          if ($LASTEXITCODE -ne 0) { throw "RunScope --self-check failed" }
+      - name: Record, observe exits and recover interrupted journal
+        run: python scripts/smoke_recording.py dist/RunScope.exe
       - name: Upload executable package
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
