@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - work/v2
   pull_request:
     branches:
       - main
@@ -12,9 +13,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: windows-build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   advisories:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -31,12 +37,24 @@ jobs:
 
   build:
     runs-on: windows-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
+
+      - name: Archive exact source
+        shell: pwsh
+        run: git archive --format=zip --output=RunScope-source.zip HEAD
+
+      - name: Upload source archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: RunScope-source
+          path: RunScope-source.zip
+          retention-days: 7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
